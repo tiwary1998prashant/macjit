@@ -1,0 +1,1960 @@
+"""
+MacJit - Garage Management System Backend
+Async event-driven architecture using internal event bus.
+Kafka & RabbitMQ adapters log events; activate by setting KAFKA_BOOTSTRAP / RABBITMQ_URL.
+Twilio (WhatsApp/SMS) and Razorpay are stubbed adapters.
+"""
+import os
+import uuid
+import json
+import asyncio
+import logging
+from pathlib import Path
+from datetime import datetime, timezone, timedelta, date
+from typing import List, Optional, Dict, Any
+
+import jwt
+import bcrypt
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, WebSocket, WebSocketDisconnect, UploadFile, File
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from dotenv import load_dotenv
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import BaseModel, Field, ConfigDict
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(name)s | %(levelname)s | %(message)s')
+logger = logging.getLogger("macjit")
+
+# ---------- DB ----------
+mongo_url = os.environ['MONGO_URL'].strip().strip('"').strip("'")
+if not (mongo_url.startswith('mongodb://') or mongo_url.startswith('mongodb+srv://')):
+    mongo_url = 'mongodb+srv://' + mongo_url
+client = AsyncIOMotorClient(mongo_url)
+db = client[os.environ['DB_NAME'].strip().strip('"').strip("'")]
+
+# ---------- Auth ----------
+JWT_SECRET = os.environ.get('JWT_SECRET', 'macjit-dev-secret-change-in-prod')
+JWT_ALG = "HS256"
+security = HTTPBearer(auto_error=False)
+
+
+def _hash_password_sync(p: str) -> str:
+    return bcrypt.hashpw(p.encode(), bcrypt.gensalt(rounds=10)).decode()
+
+
+def _verify_password_sync(p: str, h: str) -> bool:
+    try:
+        return bcrypt.checkpw(p.encode(), h.encode())
+    except Exception:
+        return False
+
+
+async def hash_password(p: str) -> str:
+    return await asyncio.to_thread(_hash_password_sync, p)
+
+
+async def verify_password(p: str, h: str) -> bool:
+    return await asyncio.to_thread(_verify_password_sync, p, h)
+
+
+def make_token(user_id: str, role: str) -> str:
+    payload = {"sub": user_id, "role": role, "exp": datetime.now(timezone.utc) + timedelta(days=7)}
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+
+
+async def get_current_user(creds: HTTPAuthorizationCredentials = Depends(security)) -> Dict[str, Any]:
+    if not creds:
+        raise HTTPException(401, "Not authenticated")
+    try:
+        payload = jwt.decode(creds.credentials, JWT_SECRET, algorithms=[JWT_ALG])
+    except jwt.PyJWTError:
+        raise HTTPException(401, "Invalid token")
+    user = await db.users.find_one({"id": payload["sub"]}, {"_id": 0, "password_hash": 0})
+    if not user:
+        raise HTTPException(401, "User not found")
+    return user
+
+
+def require_roles(*roles):
+    async def checker(user=Depends(get_current_user)):
+        if user["role"] not in roles:
+            raise HTTPException(403, f"Requires role(s): {','.join(roles)}")
+        return user
+    return checker
+
+
+# ---------- Models ----------
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+class LoginIn(BaseModel):
+    username: Optional[str] = None
+    phone: Optional[str] = None
+    password: str
+
+
+class BookingCreate(BaseModel):
+    customer_id: Optional[str] = None
+    customer_name: Optional[str] = None
+    customer_phone: Optional[str] = None
+    car_make: str
+    car_model: str
+    plate_number: str
+    service_type: str
+    notes: Optional[str] = ""
+
+
+class StaffCreate(BaseModel):
+    name: str
+    phone: str
+    role: str  # mechanic | reception | tester | admin
+
+
+class PricingIn(BaseModel):
+    service_type: str
+    base_price: float
+
+
+class AssignIn(BaseModel):
+    mechanic_id: str
+    bay_id: str
+
+
+class ItemAdd(BaseModel):
+    inventory_id: str
+    qty: int = 1
+
+
+class ApprovalReq(BaseModel):
+    reason: str
+    extra_cost: float = 0.0
+
+
+class InventoryIn(BaseModel):
+    name: str
+    sku: str
+    category: str
+    price: float
+    stock: int
+    low_stock_threshold: int = 5
+    stocked_at: Optional[str] = None
+    expiry_at: Optional[str] = None
+
+
+class BulkInventory(BaseModel):
+    items: List[InventoryIn]
+
+
+class EnquiryIn(BaseModel):
+    name: str
+    phone: str
+    email: Optional[str] = ""
+    car_make: Optional[str] = ""
+    car_model: Optional[str] = ""
+    service_interest: Optional[str] = ""
+    message: Optional[str] = ""
+
+
+class LeaveIn(BaseModel):
+    leave_type: str  # casual | earned | sick | unpaid
+    start_date: str  # ISO date
+    end_date: str
+    reason: str = ""
+
+
+class LeaveDecision(BaseModel):
+    decision: str  # approved | rejected
+    note: str = ""
+
+
+class HolidayIn(BaseModel):
+    date: str
+    name: str
+    type: str = "public"  # public | optional
+
+
+class ProfileUpdate(BaseModel):
+    monthly_salary: Optional[float] = None
+    designation: Optional[str] = None
+    join_date: Optional[str] = None
+    leave_balance: Optional[Dict[str, int]] = None  # {casual: 12, earned: 15}
+
+
+class BonusIn(BaseModel):
+    user_id: str
+    amount: float
+    reason: str
+    event_type: str = "bonus"  # bonus | extra_work | salary_credited
+
+
+class ShopSaleLine(BaseModel):
+    inventory_id: str
+    qty: int = 1
+
+
+class ShopSaleIn(BaseModel):
+    customer_name: Optional[str] = ""
+    customer_phone: Optional[str] = ""
+    items: List[ShopSaleLine]
+    payment_method: str = "cash"  # cash | razorpay
+
+
+class UserOut(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str
+    username: str
+    name: str
+    role: str
+    phone: Optional[str] = None
+
+
+# ---------- Event Bus + Adapters ----------
+class EventBus:
+    def __init__(self):
+        self.subscribers: Dict[str, List[asyncio.Queue]] = {}  # user_id -> queues
+
+    async def subscribe(self, user_id: str) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue()
+        self.subscribers.setdefault(user_id, []).append(q)
+        return q
+
+    def unsubscribe(self, user_id: str, q: asyncio.Queue):
+        if user_id in self.subscribers and q in self.subscribers[user_id]:
+            self.subscribers[user_id].remove(q)
+
+    async def fanout(self, user_ids: List[str], event: dict):
+        for uid in set(user_ids):
+            for q in self.subscribers.get(uid, []):
+                try:
+                    q.put_nowait(event)
+                except asyncio.QueueFull:
+                    pass
+
+
+bus = EventBus()
+
+
+class KafkaAdapter:
+    """Publishes to Confluent Kafka when KAFKA_BOOTSTRAP/API_KEY/API_SECRET are set."""
+    enabled = bool(os.environ.get("KAFKA_BOOTSTRAP") and os.environ.get("KAFKA_API_KEY"))
+    _producer = None
+
+    @classmethod
+    def _get(cls):
+        if cls._producer is None and cls.enabled:
+            from confluent_kafka import Producer
+            cls._producer = Producer({
+                "bootstrap.servers": os.environ["KAFKA_BOOTSTRAP"],
+                "security.protocol": "SASL_SSL",
+                "sasl.mechanisms": "PLAIN",
+                "sasl.username": os.environ["KAFKA_API_KEY"],
+                "sasl.password": os.environ["KAFKA_API_SECRET"],
+            })
+        return cls._producer
+
+    @classmethod
+    async def publish(cls, topic: str, event: dict):
+        if cls.enabled:
+            try:
+                p = cls._get()
+                p.produce(topic, json.dumps(event).encode())
+                p.poll(0)
+                logger.info(f"[KAFKA->{topic}] {event['type']}")
+            except Exception as e:
+                logger.error(f"[KAFKA-ERR] {e}")
+        else:
+            logger.info(f"[KAFKA-MOCK->{topic}] {event['type']} | id={event.get('booking_id','')}")
+
+
+class RabbitAdapter:
+    """Publishes to CloudAMQP when RABBITMQ_URL is set."""
+    enabled = bool(os.environ.get("RABBITMQ_URL"))
+    _conn = None
+
+    @classmethod
+    async def _channel(cls):
+        if cls._conn is None and cls.enabled:
+            import aio_pika
+            cls._conn = await aio_pika.connect_robust(os.environ["RABBITMQ_URL"])
+        return await cls._conn.channel() if cls._conn else None
+
+    @classmethod
+    async def enqueue(cls, queue_name: str, payload: dict):
+        if cls.enabled:
+            try:
+                import aio_pika
+                ch = await cls._channel()
+                await ch.declare_queue(queue_name, durable=True)
+                await ch.default_exchange.publish(
+                    aio_pika.Message(json.dumps(payload).encode()),
+                    routing_key=queue_name,
+                )
+                logger.info(f"[RABBITMQ->{queue_name}] published")
+            except Exception as e:
+                logger.error(f"[RABBITMQ-ERR] {e}")
+        else:
+            logger.info(f"[RABBITMQ-MOCK->{queue_name}] enqueued payload")
+
+
+class TwilioAdapter:
+    enabled = bool(os.environ.get("TWILIO_ACCOUNT_SID") and os.environ.get("TWILIO_AUTH_TOKEN"))
+
+    @classmethod
+    async def _post(cls, body_data: dict):
+        import httpx
+        sid = os.environ["TWILIO_ACCOUNT_SID"]
+        tok = os.environ["TWILIO_AUTH_TOKEN"]
+        url = f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
+        async with httpx.AsyncClient(timeout=10) as cli:
+            r = await cli.post(url, data=body_data, auth=(sid, tok))
+            return r.status_code, r.text
+
+    @classmethod
+    async def send_whatsapp(cls, to: str, body: str):
+        if cls.enabled:
+            try:
+                from_num = os.environ.get("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886").strip()
+                if not from_num.startswith("whatsapp:"):
+                    from_num = "whatsapp:" + from_num
+                code, body_resp = await cls._post({"From": from_num, "To": f"whatsapp:{to}", "Body": body})
+                logger.info(f"[TWILIO-WA->{to}] {code} {body_resp[:200] if code >= 400 else ''}")
+            except Exception as e:
+                logger.error(f"[TWILIO-WA-ERR] {e}")
+        else:
+            logger.info(f"[TWILIO-WA-MOCK->{to}] {body[:80]}")
+
+    @classmethod
+    async def send_sms(cls, to: str, body: str):
+        if cls.enabled:
+            try:
+                from_num = os.environ.get("TWILIO_SMS_FROM", "+15005550006")
+                code, _ = await cls._post({"From": from_num, "To": to, "Body": body})
+                logger.info(f"[TWILIO-SMS->{to}] {code}")
+            except Exception as e:
+                logger.error(f"[TWILIO-SMS-ERR] {e}")
+        else:
+            logger.info(f"[TWILIO-SMS-MOCK->{to}] {body[:80]}")
+
+
+class RazorpayAdapter:
+    enabled = bool(os.environ.get("RAZORPAY_KEY_ID") and os.environ.get("RAZORPAY_KEY_SECRET"))
+
+    @classmethod
+    async def create_payment_link(cls, amount: float, booking_id: str, customer_phone: str = "") -> str:
+        if cls.enabled:
+            try:
+                import httpx
+                async with httpx.AsyncClient(timeout=10) as cli:
+                    r = await cli.post(
+                        "https://api.razorpay.com/v1/payment_links",
+                        json={
+                            "amount": int(amount * 100),
+                            "currency": "INR",
+                            "description": f"Booking {booking_id[:8]}",
+                            "customer": {"contact": customer_phone} if customer_phone else {},
+                            "notify": {"sms": bool(customer_phone), "whatsapp": bool(customer_phone)},
+                        },
+                        auth=(os.environ["RAZORPAY_KEY_ID"], os.environ["RAZORPAY_KEY_SECRET"]),
+                    )
+                    return r.json().get("short_url", f"https://rzp.io/error/{booking_id}")
+            except Exception as e:
+                logger.error(f"[RAZORPAY-ERR] {e}")
+        link_id = uuid.uuid4().hex[:10]
+        return f"https://rzp.io/test/{link_id}?amount={amount}&booking={booking_id}"
+
+
+# ---------- Event Pipeline ----------
+async def publish_event(event_type: str, booking: dict, recipients: List[str], extra: dict = None):
+    """Single point that: stores event, fans out via WebSocket, calls Kafka/Rabbit/Twilio adapters."""
+    extra = extra or {}
+    event = {
+        "id": str(uuid.uuid4()),
+        "type": event_type,
+        "booking_id": booking.get("id"),
+        "ts": now_iso(),
+        "data": {**{k: v for k, v in booking.items() if k != "_id"}, **extra},
+    }
+    await db.events.insert_one(dict(event))
+    event.pop("_id", None)
+
+    # Build template context once (used for both notif body and Twilio msg)
+    _mech = booking.get("mechanic_name") or "our team"
+    _tester = booking.get("tester_name") or ""
+    _ctx = {
+        "plate": booking.get("plate_number", ""),
+        "id": (booking.get("id") or "")[:6],
+        "mechanic": _mech,
+        "tester": _tester,
+        "tester_part": f" by {_tester}" if _tester else "",
+    }
+
+    # Notifications stored per recipient
+    for uid in set(recipients):
+        notif = {
+            "id": str(uuid.uuid4()),
+            "user_id": uid,
+            "event_type": event_type,
+            "booking_id": booking.get("id"),
+            "title": EVENT_TITLES.get(event_type, event_type),
+            "body": EVENT_BODIES.get(event_type, "").format(**_ctx),
+            "read": False,
+            "ts": now_iso(),
+        }
+        await db.notifications.insert_one(dict(notif))
+
+    await bus.fanout(recipients, event)
+
+    # Adapter side-effects
+    await KafkaAdapter.publish("garage.events", event)
+    await RabbitAdapter.enqueue(f"queue.{event_type.lower()}", event)
+
+    # Twilio for customer-facing transitions
+    customer_id = booking.get("customer_id")
+    if customer_id and event_type in CUSTOMER_NOTIFY_EVENTS:
+        cust = await db.users.find_one({"id": customer_id}, {"_id": 0})
+        if cust and cust.get("phone"):
+            msg = EVENT_BODIES.get(event_type, "").format(**_ctx)
+            await TwilioAdapter.send_whatsapp(cust["phone"], msg)
+            await TwilioAdapter.send_sms(cust["phone"], msg)
+
+
+EVENT_TITLES = {
+    "BOOKING_CREATED": "New Booking",
+    "BOOKING_ASSIGNED": "Vehicle Assigned",
+    "SERVICE_STARTED": "Service Started",
+    "APPROVAL_REQUESTED": "Approval Needed",
+    "APPROVAL_GRANTED": "Customer Approved",
+    "SERVICE_FINISHED": "Service Finished",
+    "QA_DONE": "QA Done - Ready for Pickup",
+    "BILLED": "Bill Generated",
+    "PAID": "Payment Received",
+}
+EVENT_BODIES = {
+    "BOOKING_CREATED": "MacJit: Booking #{id} for {plate} confirmed. Mechanic {mechanic} will handle your car.",
+    "BOOKING_ASSIGNED": "MacJit: Your car {plate} is assigned to mechanic {mechanic}.",
+    "SERVICE_STARTED": "MacJit: Service started on {plate} by {mechanic}. We'll keep you posted.",
+    "APPROVAL_REQUESTED": "MacJit: {mechanic} needs your approval for extra work on {plate}. Please open the app.",
+    "APPROVAL_GRANTED": "MacJit: Approval received for extra work on {plate}.",
+    "SERVICE_FINISHED": "MacJit: {mechanic} finished work on {plate}. Now in QA.",
+    "QA_DONE": "MacJit: {plate} passed QA{tester_part}. Ready for pickup!",
+    "BILLED": "MacJit: Bill for {plate} generated. Payment link sent on WhatsApp/SMS.",
+    "PAID": "MacJit: Payment received for {plate}. Thanks for choosing us — drive safe!",
+}
+CUSTOMER_NOTIFY_EVENTS = {"BOOKING_CREATED", "SERVICE_STARTED", "APPROVAL_REQUESTED",
+                          "SERVICE_FINISHED", "QA_DONE", "BILLED", "PAID"}
+
+# ---------- Auto-Assignment (8am-6pm service window) ----------
+SERVICE_DURATION_MIN = 120  # default fallback
+SERVICE_DURATION_BY_TYPE = {
+    "oil-change": 45,
+    "general": 120,        # 2h
+    "ac-service": 90,
+    "alignment": 60,
+    "brake": 75,
+    "engine": 240,         # 4h
+    "full-service": 210,   # 3h 30m
+}
+SHOP_OPEN_HOUR = 8
+SHOP_CLOSE_HOUR = 18  # 6 PM
+ACTIVE_STATUSES = {"ASSIGNED", "IN_SERVICE"}
+
+
+def _next_open_slot(after: datetime) -> datetime:
+    """Snap a datetime forward to next 8:00-18:00 working window."""
+    dt = after
+    if dt.hour < SHOP_OPEN_HOUR:
+        dt = dt.replace(hour=SHOP_OPEN_HOUR, minute=0, second=0, microsecond=0)
+    elif dt.hour >= SHOP_CLOSE_HOUR:
+        dt = (dt + timedelta(days=1)).replace(hour=SHOP_OPEN_HOUR, minute=0, second=0, microsecond=0)
+    return dt
+
+
+def _shift_within_hours(start: datetime, duration_min: int) -> tuple:
+    """If the slot crosses 18:00, push start to next day 08:00."""
+    start = _next_open_slot(start)
+    end = start + timedelta(minutes=duration_min)
+    close_today = start.replace(hour=SHOP_CLOSE_HOUR, minute=0, second=0, microsecond=0)
+    if end > close_today:
+        start = (start + timedelta(days=1)).replace(hour=SHOP_OPEN_HOUR, minute=0, second=0, microsecond=0)
+        end = start + timedelta(minutes=duration_min)
+    return start, end
+
+
+async def auto_assign_booking(booking_id: str) -> Optional[dict]:
+    """Pick mechanic with earliest free slot + first available bay, set ETA fields."""
+    booking = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+    if not booking:
+        return None
+    duration_min = SERVICE_DURATION_BY_TYPE.get(booking.get("service_type", "general"), SERVICE_DURATION_MIN)
+    mechanics = await db.users.find({"role": "mechanic"}, {"_id": 0}).to_list(100)
+    bays = await db.bays.find({}, {"_id": 0}).to_list(100)
+    if not mechanics or not bays:
+        return None
+
+    now = datetime.now(timezone.utc)
+    # mechanic free time = max(end of last assigned/in-service booking, now)
+    mech_free = {}
+    for m in mechanics:
+        active = await db.bookings.find(
+            {"mechanic_id": m["id"], "status": {"$in": list(ACTIVE_STATUSES)}},
+            {"_id": 0}
+        ).to_list(100)
+        latest_end = now
+        for b in active:
+            est = b.get("estimated_end_at")
+            if est:
+                try:
+                    end_dt = datetime.fromisoformat(est)
+                    if end_dt > latest_end:
+                        latest_end = end_dt
+                except ValueError:
+                    pass
+        mech_free[m["id"]] = (m, latest_end)
+
+    # earliest free mechanic
+    mech_id, (mech, free_at) = min(mech_free.items(), key=lambda kv: kv[1][1])
+
+    # first bay not currently occupied
+    busy_bay_ids = set()
+    async for b in db.bookings.find(
+        {"status": {"$in": list(ACTIVE_STATUSES)}}, {"_id": 0, "bay_id": 1}
+    ):
+        if b.get("bay_id"):
+            busy_bay_ids.add(b["bay_id"])
+    free_bays = [b for b in bays if b["id"] not in busy_bay_ids]
+    bay = free_bays[0] if free_bays else bays[0]  # fallback (will queue)
+
+    start_at, end_at = _shift_within_hours(free_at, duration_min)
+    upd = {
+        "mechanic_id": mech["id"], "mechanic_name": mech["name"],
+        "mechanic_phone": mech.get("phone"),
+        "bay_id": bay["id"], "bay_name": bay["name"],
+        "status": "ASSIGNED",
+        "estimated_start_at": start_at.isoformat(),
+        "estimated_end_at": end_at.isoformat(),
+        "estimated_duration_min": duration_min,
+        "auto_assigned": True,
+    }
+    await db.bookings.update_one({"id": booking_id}, {"$set": upd})
+    return await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+
+
+
+# ---------- App Setup ----------
+app = FastAPI(title="MacJit GMS")
+api = APIRouter(prefix="/api")
+
+
+async def get_recipients_for_booking(booking: dict, include_customer=True, include_admin=True,
+                                     include_reception=True, include_mechanic=True, include_tester=False) -> List[str]:
+    ids = []
+    if include_customer and booking.get("customer_id"):
+        ids.append(booking["customer_id"])
+    if booking.get("mechanic_id") and include_mechanic:
+        ids.append(booking["mechanic_id"])
+    role_filter = []
+    if include_reception:
+        role_filter.append("reception")
+    if include_admin:
+        role_filter.append("admin")
+    if include_tester:
+        role_filter.append("tester")
+    if role_filter:
+        async for u in db.users.find({"role": {"$in": role_filter}}, {"_id": 0, "id": 1}):
+            ids.append(u["id"])
+    return ids
+
+
+# ---------- AUTH ROUTES ----------
+@api.post("/auth/login")
+async def login(data: LoginIn):
+    q = {"username": data.username} if data.username else {"phone": data.phone}
+    user = await db.users.find_one(q)
+    if not user or not await verify_password(data.password, user["password_hash"]):
+        raise HTTPException(401, "Invalid credentials")
+    token = make_token(user["id"], user["role"])
+    user.pop("_id", None); user.pop("password_hash", None)
+    return {"token": token, "user": user}
+
+
+def _normalize_phone(p: str) -> str:
+    """Normalise to +91XXXXXXXXXX for Indian numbers."""
+    p = (p or "").strip().replace(" ", "").replace("-", "")
+    if not p:
+        return p
+    if p.startswith("+"):
+        return p
+    digits = "".join(c for c in p if c.isdigit())
+    if len(digits) == 10:
+        return "+91" + digits
+    if len(digits) == 12 and digits.startswith("91"):
+        return "+" + digits
+    return "+" + digits if digits else p
+
+
+@api.post("/auth/otp/request")
+async def otp_request(data: dict):
+    """Customer-only login. Send a 6-digit OTP to the phone via SMS."""
+    import random
+    phone = _normalize_phone(data.get("phone", ""))
+    if not phone or len(phone) < 10:
+        raise HTTPException(400, "Valid phone number required")
+    code = f"{random.randint(0, 999999):06d}"
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+    # Invalidate any prior unconsumed OTPs for this phone
+    await db.otps.delete_many({"phone": phone, "consumed": False})
+    await db.otps.insert_one({
+        "id": str(uuid.uuid4()),
+        "phone": phone,
+        "code": code,
+        "expires_at": expires_at,
+        "consumed": False,
+        "attempts": 0,
+        "created_at": now_iso(),
+    })
+    msg = f"MacJit: Your login OTP is {code}. Valid for 5 minutes. Do not share."
+    await TwilioAdapter.send_sms(phone, msg)
+    await TwilioAdapter.send_whatsapp(phone, msg)
+    logger.info(f"[OTP] sent to {phone[:6]}***")
+    # Return the code in non-prod when Twilio is mocked, so dev/QA can test.
+    debug_payload = {}
+    if not TwilioAdapter.enabled or not os.environ.get("TWILIO_SMS_FROM"):
+        debug_payload = {"debug_otp": code}
+    return {"ok": True, "expires_in": 300, **debug_payload}
+
+
+@api.post("/auth/otp/verify")
+async def otp_verify(data: dict):
+    """Verify OTP. If user doesn't exist, auto-create as customer. Return JWT."""
+    phone = _normalize_phone(data.get("phone", ""))
+    code = (data.get("otp") or data.get("code") or "").strip()
+    name = (data.get("name") or "").strip()  # optional, used only for new customers
+    if not phone or not code:
+        raise HTTPException(400, "Phone and OTP required")
+
+    rec = await db.otps.find_one({"phone": phone, "consumed": False}, sort=[("created_at", -1)])
+    if not rec:
+        raise HTTPException(400, "OTP not found or already used. Please request a new one.")
+    # Expiry check
+    try:
+        if datetime.fromisoformat(rec["expires_at"]) < datetime.now(timezone.utc):
+            raise HTTPException(400, "OTP expired. Please request a new one.")
+    except (ValueError, TypeError):
+        raise HTTPException(400, "OTP expired. Please request a new one.")
+    # Attempt cap
+    if rec.get("attempts", 0) >= 5:
+        await db.otps.update_one({"id": rec["id"]}, {"$set": {"consumed": True}})
+        raise HTTPException(429, "Too many attempts. Request a new OTP.")
+    if rec["code"] != code:
+        await db.otps.update_one({"id": rec["id"]}, {"$inc": {"attempts": 1}})
+        raise HTTPException(400, "Invalid OTP")
+    # Mark consumed
+    await db.otps.update_one({"id": rec["id"]}, {"$set": {"consumed": True}})
+
+    # Find or create customer
+    user = await db.users.find_one({"phone": phone, "role": "customer"})
+    if not user:
+        # Don't conflict with admin user that has same phone — only auto-create if no user with this phone exists at all
+        any_user = await db.users.find_one({"phone": phone})
+        if any_user:
+            user = any_user
+        else:
+            user = {
+                "id": str(uuid.uuid4()),
+                "username": phone,
+                "name": name or "Customer",
+                "phone": phone,
+                "role": "customer",
+                "password_hash": "",  # OTP-only login
+                "total_spent": 0,
+                "loyalty_tier": "BRONZE",
+                "created_at": now_iso(),
+            }
+            await db.users.insert_one(dict(user))
+            logger.info(f"[OTP] auto-created customer {phone[:6]}***")
+    user.pop("_id", None); user.pop("password_hash", None)
+    token = make_token(user["id"], user["role"])
+    return {"token": token, "user": user}
+
+
+
+
+@api.post("/auth/reset-request")
+async def reset_request(data: dict):
+    phone = data.get("phone")
+    user = await db.users.find_one({"phone": phone})
+    if not user:
+        return {"ok": True}  # silent
+    token = uuid.uuid4().hex
+    await db.password_resets.insert_one({"token": token, "user_id": user["id"], "ts": now_iso()})
+    link = f"{os.environ.get('PUBLIC_URL', '')}/reset?token={token}"
+    await TwilioAdapter.send_sms(phone, f"MacJit password reset: {link}")
+    return {"ok": True}
+
+
+@api.post("/auth/reset-confirm")
+async def reset_confirm(data: dict):
+    token = data.get("token"); new_password = data.get("password")
+    rec = await db.password_resets.find_one({"token": token})
+    if not rec:
+        raise HTTPException(400, "Invalid token")
+    h = await hash_password(new_password)
+    await db.users.update_one({"id": rec["user_id"]}, {"$set": {"password_hash": h}})
+    await db.password_resets.delete_one({"token": token})
+    return {"ok": True}
+
+
+@api.get("/auth/me")
+async def me(user=Depends(get_current_user)):
+    return user
+
+
+@api.get("/users")
+async def list_users(user=Depends(require_roles("reception", "admin"))):
+    return await db.users.find({}, {"_id": 0, "password_hash": 0}).to_list(500)
+
+
+@api.get("/users/by-role/{role}")
+async def users_by_role(role: str, user=Depends(get_current_user)):
+    return await db.users.find({"role": role}, {"_id": 0, "password_hash": 0}).to_list(500)
+
+
+# ---------- BAYS ----------
+@api.get("/bays")
+async def list_bays(user=Depends(get_current_user)):
+    return await db.bays.find({}, {"_id": 0}).to_list(100)
+
+
+# ---------- BOOKINGS ----------
+@api.post("/bookings")
+async def create_booking(data: BookingCreate, user=Depends(require_roles("reception", "admin"))):
+    # Walk-in path: auto-create or match customer by phone
+    if not data.customer_id:
+        if not (data.customer_phone and data.customer_name):
+            raise HTTPException(400, "Provide customer_id OR (customer_name + customer_phone)")
+        existing = await db.users.find_one({"phone": data.customer_phone, "role": "customer"})
+        if existing:
+            customer = existing
+        else:
+            cid = str(uuid.uuid4())
+            tmp_pwd = uuid.uuid4().hex[:8]
+            customer = {
+                "id": cid, "username": data.customer_phone, "name": data.customer_name,
+                "phone": data.customer_phone, "role": "customer",
+                "password_hash": await hash_password(tmp_pwd),
+                "total_spent": 0, "loyalty_tier": "BRONZE",
+                "created_at": now_iso(),
+            }
+            await db.users.insert_one(dict(customer))
+            await TwilioAdapter.send_sms(data.customer_phone,
+                f"Welcome to MacJit! Login: {data.customer_phone} Pwd: {tmp_pwd}")
+    else:
+        customer = await db.users.find_one({"id": data.customer_id, "role": "customer"})
+        if not customer:
+            raise HTTPException(404, "Customer not found")
+    booking = {
+        "id": str(uuid.uuid4()),
+        "customer_id": customer["id"],
+        "customer_name": customer["name"],
+        "car_make": data.car_make,
+        "car_model": data.car_model,
+        "plate_number": data.plate_number,
+        "service_type": data.service_type,
+        "notes": data.notes,
+        "status": "BOOKED",
+        "mechanic_id": None,
+        "mechanic_name": None,
+        "bay_id": None,
+        "bay_name": None,
+        "items": [],
+        "approval_pending": False,
+        "approval_reason": None,
+        "extra_cost": 0.0,
+        "stream_active": False,
+        "bill_amount": 0.0,
+        "payment_link": None,
+        "paid": False,
+        "auto_assigned": False,
+        "estimated_start_at": None,
+        "estimated_end_at": None,
+        "created_at": now_iso(),
+        "started_at": None,
+        "finished_at": None,
+        "qa_done_at": None,
+        "billed_at": None,
+        "paid_at": None,
+    }
+    await db.bookings.insert_one(dict(booking))
+    booking.pop("_id", None)
+    # Auto-assign mechanic + bay (1h45m slot, 8am–6pm). No manual reception step.
+    assigned = await auto_assign_booking(booking["id"])
+    if assigned:
+        booking = assigned
+        recipients = await get_recipients_for_booking(booking)
+        await publish_event("BOOKING_CREATED", booking, recipients,
+                            extra={"auto_assigned_to": booking.get("mechanic_name"),
+                                   "estimated_start_at": booking.get("estimated_start_at"),
+                                   "estimated_end_at": booking.get("estimated_end_at")})
+        await publish_event("BOOKING_ASSIGNED", booking, recipients)
+    else:
+        recipients = await get_recipients_for_booking(booking)
+        await publish_event("BOOKING_CREATED", booking, recipients)
+    return booking
+
+
+@api.get("/bookings")
+async def list_bookings(status: Optional[str] = None, user=Depends(get_current_user)):
+    q = {}
+    if status:
+        q["status"] = status
+    if user["role"] == "customer":
+        q["customer_id"] = user["id"]
+    elif user["role"] == "mechanic":
+        q["mechanic_id"] = user["id"]
+    elif user["role"] == "tester":
+        q["status"] = {"$in": ["READY_TO_TEST", "QA_DONE", "BILLED", "PAID"]}
+    return await db.bookings.find(q, {"_id": 0}).sort("created_at", -1).to_list(500)
+
+
+@api.get("/bookings/{booking_id}")
+async def get_booking(booking_id: str, user=Depends(get_current_user)):
+    b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+    if not b:
+        raise HTTPException(404, "Not found")
+    return b
+
+
+@api.post("/bookings/{booking_id}/auto-assign")
+async def reassign(booking_id: str, user=Depends(require_roles("reception", "admin"))):
+    b = await auto_assign_booking(booking_id)
+    if not b:
+        raise HTTPException(400, "No mechanics or bays available")
+    recipients = await get_recipients_for_booking(b)
+    await publish_event("BOOKING_ASSIGNED", b, recipients)
+    return b
+
+
+@api.patch("/bookings/{booking_id}/assign")
+async def assign(booking_id: str, data: AssignIn, user=Depends(require_roles("reception", "admin"))):
+    mech = await db.users.find_one({"id": data.mechanic_id, "role": "mechanic"})
+    bay = await db.bays.find_one({"id": data.bay_id})
+    if not mech or not bay:
+        raise HTTPException(404, "Mechanic or bay not found")
+    upd = {"mechanic_id": mech["id"], "mechanic_name": mech["name"],
+           "mechanic_phone": mech.get("phone"),
+           "bay_id": bay["id"], "bay_name": bay["name"],
+           "status": "ASSIGNED"}
+    await db.bookings.update_one({"id": booking_id}, {"$set": upd})
+    b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+    recipients = await get_recipients_for_booking(b)
+    await publish_event("BOOKING_ASSIGNED", b, recipients)
+    return b
+
+
+@api.post("/bookings/{booking_id}/start")
+async def start_service(booking_id: str, user=Depends(require_roles("mechanic"))):
+    b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+    if not b or b.get("mechanic_id") != user["id"]:
+        raise HTTPException(403, "Not your car")
+    upd = {"status": "IN_SERVICE", "stream_active": True, "started_at": now_iso()}
+    await db.bookings.update_one({"id": booking_id}, {"$set": upd})
+    b.update(upd)
+    recipients = await get_recipients_for_booking(b, include_admin=False)  # spec: not admin
+    await publish_event("SERVICE_STARTED", b, recipients)
+    return b
+
+
+@api.post("/bookings/{booking_id}/items")
+async def add_item(booking_id: str, data: ItemAdd, user=Depends(require_roles("mechanic"))):
+    inv = await db.inventory.find_one({"id": data.inventory_id})
+    if not inv:
+        raise HTTPException(404, "Item not found")
+    if inv["stock"] < data.qty:
+        raise HTTPException(400, "Insufficient stock")
+    line = {"inventory_id": inv["id"], "name": inv["name"], "sku": inv["sku"],
+            "qty": data.qty, "price": inv["price"], "subtotal": inv["price"] * data.qty}
+    await db.bookings.update_one({"id": booking_id}, {"$push": {"items": line}})
+    await db.inventory.update_one({"id": inv["id"]}, {"$inc": {"stock": -data.qty}})
+    return await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+
+
+@api.delete("/bookings/{booking_id}/items/{inventory_id}")
+async def remove_item(booking_id: str, inventory_id: str, user=Depends(require_roles("mechanic"))):
+    b = await db.bookings.find_one({"id": booking_id})
+    if not b:
+        raise HTTPException(404, "Not found")
+    item = next((i for i in b.get("items", []) if i["inventory_id"] == inventory_id), None)
+    if item:
+        await db.inventory.update_one({"id": inventory_id}, {"$inc": {"stock": item["qty"]}})
+    await db.bookings.update_one({"id": booking_id}, {"$pull": {"items": {"inventory_id": inventory_id}}})
+    return await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+
+
+@api.post("/bookings/{booking_id}/request-approval")
+async def request_approval(booking_id: str, data: ApprovalReq, user=Depends(require_roles("mechanic"))):
+    upd = {"approval_pending": True, "approval_reason": data.reason, "extra_cost": data.extra_cost}
+    await db.bookings.update_one({"id": booking_id}, {"$set": upd})
+    b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+    recipients = await get_recipients_for_booking(b)
+    await publish_event("APPROVAL_REQUESTED", b, recipients, extra={"reason": data.reason, "extra_cost": data.extra_cost})
+    return b
+
+
+@api.post("/bookings/{booking_id}/approve")
+async def approve(booking_id: str, user=Depends(require_roles("customer"))):
+    b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+    if not b or b["customer_id"] != user["id"]:
+        raise HTTPException(403, "Not your booking")
+    await db.bookings.update_one({"id": booking_id}, {"$set": {"approval_pending": False}})
+    b["approval_pending"] = False
+    recipients = await get_recipients_for_booking(b)
+    await publish_event("APPROVAL_GRANTED", b, recipients)
+    return b
+
+
+@api.post("/bookings/{booking_id}/finish")
+async def finish(booking_id: str, user=Depends(require_roles("mechanic"))):
+    upd = {"status": "READY_TO_TEST", "stream_active": False, "finished_at": now_iso()}
+    await db.bookings.update_one({"id": booking_id}, {"$set": upd})
+    b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+    recipients = await get_recipients_for_booking(b, include_tester=True)
+    await publish_event("SERVICE_FINISHED", b, recipients)
+    # Auto-pick the next ASSIGNED booking for this mechanic, ordered by ETA
+    nxt = await db.bookings.find_one(
+        {"mechanic_id": user["id"], "status": "ASSIGNED"},
+        {"_id": 0},
+        sort=[("estimated_start_at", 1)],
+    )
+    return {**b, "next_booking_id": nxt["id"] if nxt else None,
+            "next_booking_plate": nxt["plate_number"] if nxt else None}
+
+
+@api.post("/bookings/{booking_id}/qa-done")
+async def qa_done(booking_id: str, user=Depends(require_roles("tester"))):
+    upd = {"status": "QA_DONE", "qa_done_at": now_iso(),
+           "tester_id": user["id"], "tester_name": user["name"],
+           "tester_phone": user.get("phone")}
+    await db.bookings.update_one({"id": booking_id}, {"$set": upd})
+    b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+    recipients = await get_recipients_for_booking(b, include_tester=True)
+    await publish_event("QA_DONE", b, recipients)
+    return b
+
+
+def _calculate_bill(b: dict, pricing: Optional[dict], cust: Optional[dict],
+                    extra_discount: float = 0.0):
+    base_charge = (pricing or {}).get("base_price") or DEFAULT_PRICES.get(b.get("service_type", "general"), 800)
+    items_total = sum(i.get("subtotal", 0) for i in b.get("items", []))
+    extra_cost = b.get("extra_cost", 0) or 0
+    subtotal = base_charge + items_total + extra_cost
+    tier = (cust or {}).get("loyalty_tier", "BRONZE")
+    discount_pct = LOYALTY_DISCOUNT.get(tier, 0)
+    loyalty_discount = round(subtotal * discount_pct / 100)
+    extra_discount = max(0.0, float(extra_discount or 0))
+    total_discount = loyalty_discount + extra_discount
+    bill_amount = max(0, subtotal - total_discount)
+    return {
+        "base_charge": base_charge,
+        "items_total": items_total,
+        "extra_cost": extra_cost,
+        "subtotal": subtotal,
+        "loyalty_tier": tier,
+        "discount_pct": discount_pct,
+        "loyalty_discount": loyalty_discount,
+        "extra_discount": extra_discount,
+        "discount": total_discount,
+        "bill_amount": bill_amount,
+    }
+
+
+@api.get("/bookings/{booking_id}/bill-preview")
+async def bill_preview(booking_id: str, extra_discount: float = 0.0,
+                       user=Depends(require_roles("reception", "admin"))):
+    """Soft-copy preview for reception. Does NOT change booking status."""
+    b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+    if not b:
+        raise HTTPException(404, "Not found")
+    pricing = await db.service_prices.find_one({"service_type": b.get("service_type")}, {"_id": 0})
+    cust = await db.users.find_one({"id": b["customer_id"]}, {"_id": 0}) if b.get("customer_id") else None
+    calc = _calculate_bill(b, pricing, cust, extra_discount=extra_discount)
+    return {
+        "booking_id": booking_id,
+        "customer": {"name": (cust or {}).get("name"), "phone": (cust or {}).get("phone")},
+        "car": {"make": b.get("car_make"), "model": b.get("car_model"), "plate": b.get("plate_number")},
+        "service_type": b.get("service_type"),
+        "items": b.get("items", []),
+        "approval_reason": b.get("approval_reason"),
+        **calc,
+        "is_draft": True,
+    }
+
+
+@api.post("/bookings/{booking_id}/bill")
+async def bill(booking_id: str, data: Optional[dict] = None,
+               user=Depends(require_roles("reception", "admin"))):
+    """Confirm-and-send. Reception is expected to have called /bill-preview first.
+    Optional body: {extra_discount: float}.
+    """
+    extra_discount = float((data or {}).get("extra_discount") or 0)
+    b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+    if not b:
+        raise HTTPException(404, "Not found")
+    pricing = await db.service_prices.find_one({"service_type": b.get("service_type")}, {"_id": 0})
+    cust = await db.users.find_one({"id": b["customer_id"]}, {"_id": 0}) if b.get("customer_id") else None
+    calc = _calculate_bill(b, pricing, cust, extra_discount=extra_discount)
+    bill_amount = calc["bill_amount"]
+    link = await RazorpayAdapter.create_payment_link(bill_amount, booking_id,
+                                                    (cust or {}).get("phone", ""))
+    upd = {"status": "BILLED",
+           "bill_amount": bill_amount,
+           "subtotal": calc["subtotal"],
+           "discount": calc["discount"],
+           "discount_pct": calc["discount_pct"],
+           "loyalty_discount": calc["loyalty_discount"],
+           "extra_discount": calc["extra_discount"],
+           "loyalty_tier": calc["loyalty_tier"],
+           "payment_link": link, "billed_at": now_iso(),
+           "billed_by": user["id"]}
+    await db.bookings.update_one({"id": booking_id}, {"$set": upd})
+    b.update(upd)
+    recipients = await get_recipients_for_booking(b)
+    await publish_event("BILLED", b, recipients,
+                        extra={"bill_amount": bill_amount, "payment_link": link})
+    return b
+
+
+@api.post("/bookings/{booking_id}/pay")
+async def pay(booking_id: str, user=Depends(get_current_user)):
+    if user["role"] not in ("reception", "admin", "customer"):
+        raise HTTPException(403, "Forbidden")
+    if user["role"] == "customer":
+        b0 = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+        if not b0 or b0.get("customer_id") != user["id"]:
+            raise HTTPException(403, "Not your booking")
+    upd = {"status": "PAID", "paid": True, "paid_at": now_iso()}
+    await db.bookings.update_one({"id": booking_id}, {"$set": upd})
+    b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+    # update customer total_spent + loyalty tier
+    if b.get("customer_id"):
+        bookings = await db.bookings.find({"customer_id": b["customer_id"], "paid": True}, {"_id": 0, "bill_amount": 1}).to_list(1000)
+        total = sum(x.get("bill_amount", 0) for x in bookings)
+        tier = "GOLD" if total >= 25000 else ("SILVER" if total >= 10000 else "BRONZE")
+        await db.users.update_one({"id": b["customer_id"]}, {"$set": {"total_spent": total, "loyalty_tier": tier}})
+    # Send invoice (PDF link + summary) to customer via SMS + WhatsApp
+    cust = await db.users.find_one({"id": b.get("customer_id")}, {"_id": 0}) if b.get("customer_id") else None
+    if cust and cust.get("phone"):
+        public_url = os.environ.get("PUBLIC_URL") or os.environ.get("APP_URL") or ""
+        invoice_url = f"{public_url}/api/invoices/{booking_id}.pdf"
+        items_summary = ", ".join([f"{i['name']} x{i['qty']}" for i in (b.get("items") or [])][:3]) or "Service"
+        msg = (
+            f"MacJit Invoice — {b.get('plate_number','')}\n"
+            f"Service: {b.get('service_type','')}\n"
+            f"Items: {items_summary}\n"
+            f"Total Paid: \u20B9{b.get('bill_amount',0)}\n"
+            f"Invoice: {invoice_url}\n"
+            f"Thanks for choosing MacJit. Drive safe!"
+        )
+        await TwilioAdapter.send_sms(cust["phone"], msg)
+        await TwilioAdapter.send_whatsapp(cust["phone"], msg)
+    recipients = await get_recipients_for_booking(b)
+    await publish_event("PAID", b, recipients)
+    return b
+
+
+# ---------- Invoice PDF (public) ----------
+@api.get("/invoices/{booking_id}.pdf")
+async def invoice_pdf(booking_id: str):
+    """Public PDF invoice. Anyone with the booking_id can view/download.
+    Available once a bill has been generated (status BILLED or PAID)."""
+    from io import BytesIO
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from fastapi.responses import Response
+
+    b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+    if not b:
+        raise HTTPException(404, "Not found")
+    if b.get("status") not in ("BILLED", "PAID"):
+        raise HTTPException(400, "Bill not generated yet")
+    cust = await db.users.find_one({"id": b.get("customer_id")}, {"_id": 0}) if b.get("customer_id") else None
+
+    biz_name = os.environ.get("BUSINESS_NAME", "MacJit")
+    biz_loc = os.environ.get("BUSINESS_LOCATION", "Varthur, Bangalore - 560087")
+    biz_phone = os.environ.get("BUSINESS_PHONE", "+91 93534 01156")
+    biz_email = os.environ.get("BUSINESS_EMAIL", "hello@macjit.com")
+    biz_domain = os.environ.get("BUSINESS_DOMAIN", "macjit.com")
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, rightMargin=20 * mm,
+                            leftMargin=20 * mm, topMargin=18 * mm, bottomMargin=18 * mm)
+    styles = getSampleStyleSheet()
+    h1 = ParagraphStyle("h1", parent=styles["Heading1"], fontSize=22, textColor=colors.HexColor("#1E2A44"))
+    h2 = ParagraphStyle("h2", parent=styles["Heading2"], fontSize=12, textColor=colors.HexColor("#F26A21"))
+    body = styles["BodyText"]
+    small = ParagraphStyle("small", parent=body, fontSize=9, textColor=colors.HexColor("#555"))
+
+    story = []
+    # Header
+    story.append(Paragraph(f"<b>{biz_name.upper()}</b> <font size=11 color='#F26A21'>· Mechanic Just In Time</font>", h1))
+    story.append(Paragraph(f"{biz_loc} · {biz_phone} · {biz_email} · {biz_domain}", small))
+    story.append(Spacer(1, 8 * mm))
+    story.append(Paragraph(f"<b>TAX INVOICE</b>  &nbsp;&nbsp; <font color='#888'>#{booking_id[:8].upper()}</font>", h2))
+    status_label = "PAID" if b.get("paid") else "DUE"
+    color_box = "#16A34A" if b.get("paid") else "#F26A21"
+    story.append(Paragraph(
+        f"<font color='{color_box}'><b>STATUS: {status_label}</b></font> &nbsp;&nbsp; "
+        f"Date: {(b.get('paid_at') or b.get('billed_at') or '')[:10]}",
+        body))
+    story.append(Spacer(1, 4 * mm))
+
+    # Customer & vehicle
+    info_data = [
+        ["Customer", (cust or {}).get("name", "—"), "Vehicle", f"{b.get('car_make','')} {b.get('car_model','')}"],
+        ["Phone", (cust or {}).get("phone", "—"), "Plate", b.get("plate_number", "—")],
+        ["Service", b.get("service_type", "—"), "Mechanic", b.get("mechanic_name") or "—"],
+    ]
+    info_tbl = Table(info_data, colWidths=[28 * mm, 60 * mm, 28 * mm, 50 * mm])
+    info_tbl.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+        ("FONTSIZE", (0, 0), (-1, -1), 10),
+        ("TEXTCOLOR", (0, 0), (0, -1), colors.HexColor("#888")),
+        ("TEXTCOLOR", (2, 0), (2, -1), colors.HexColor("#888")),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("LINEBELOW", (0, 0), (-1, -1), 0.3, colors.HexColor("#eee")),
+    ]))
+    story.append(info_tbl)
+    story.append(Spacer(1, 6 * mm))
+
+    # Line items
+    rows = [["#", "Item / Service", "SKU", "Qty", "Rate (\u20B9)", "Amount (\u20B9)"]]
+    base_charge = b.get("subtotal", 0) - sum(i.get("subtotal", 0) for i in (b.get("items") or [])) - (b.get("extra_cost", 0) or 0)
+    rows.append([
+        "1",
+        f"Service charge ({b.get('service_type','')})",
+        "—", "1", f"{base_charge:.0f}", f"{base_charge:.0f}"
+    ])
+    for idx, it in enumerate(b.get("items") or [], start=2):
+        rows.append([
+            str(idx), it.get("name", ""), it.get("sku", ""),
+            str(it.get("qty", 0)),
+            f"{it.get('price', 0):.0f}",
+            f"{it.get('subtotal', 0):.0f}",
+        ])
+    if b.get("extra_cost"):
+        rows.append([str(len(rows)), f"Extra: {b.get('approval_reason','add-on')}", "—", "1",
+                     f"{b['extra_cost']:.0f}", f"{b['extra_cost']:.0f}"])
+    items_tbl = Table(rows, colWidths=[10 * mm, 70 * mm, 28 * mm, 14 * mm, 22 * mm, 26 * mm], repeatRows=1)
+    items_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1E2A44")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9.5),
+        ("ALIGN", (3, 0), (-1, -1), "RIGHT"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#FAF8F5")]),
+        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#ddd")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#eee")),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(items_tbl)
+    story.append(Spacer(1, 4 * mm))
+
+    # Totals
+    tot_rows = [
+        ["Subtotal", f"\u20B9{b.get('subtotal', 0):.0f}"],
+    ]
+    if b.get("loyalty_discount"):
+        tot_rows.append([f"Loyalty discount ({b.get('loyalty_tier','')} – {b.get('discount_pct',0)}%)",
+                         f"-\u20B9{b['loyalty_discount']:.0f}"])
+    if b.get("extra_discount"):
+        tot_rows.append(["Reception discount", f"-\u20B9{b['extra_discount']:.0f}"])
+    tot_rows.append(["TOTAL PAID" if b.get("paid") else "AMOUNT DUE",
+                     f"\u20B9{b.get('bill_amount', 0):.0f}"])
+    tot_tbl = Table(tot_rows, colWidths=[120 * mm, 50 * mm], hAlign="RIGHT")
+    tot_tbl.setStyle(TableStyle([
+        ("FONTSIZE", (0, 0), (-1, -1), 10),
+        ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+        ("FONTSIZE", (0, -1), (-1, -1), 13),
+        ("TEXTCOLOR", (0, -1), (-1, -1), colors.HexColor("#F26A21")),
+        ("LINEABOVE", (0, -1), (-1, -1), 1, colors.HexColor("#1E2A44")),
+        ("TOPPADDING", (0, -1), (-1, -1), 6),
+    ]))
+    story.append(tot_tbl)
+    story.append(Spacer(1, 8 * mm))
+    story.append(Paragraph(
+        "Thank you for choosing MacJit. For any queries please reach us at "
+        f"{biz_phone} or {biz_email}.",
+        small))
+    story.append(Paragraph("This is a computer-generated invoice; no signature required.", small))
+
+    doc.build(story)
+    pdf = buf.getvalue()
+    buf.close()
+    return Response(content=pdf, media_type="application/pdf",
+                    headers={"Content-Disposition": f'inline; filename="MacJit-{booking_id[:8]}.pdf"'})
+
+
+
+# ---------- Pricing ----------
+DEFAULT_PRICES = {"general": 800, "oil-change": 500, "full-service": 1800, "tire": 600, "engine": 2500}
+LOYALTY_DISCOUNT = {"BRONZE": 0, "SILVER": 5, "GOLD": 10}
+
+
+@api.get("/pricing")
+async def list_pricing(user=Depends(get_current_user)):
+    items = await db.service_prices.find({}, {"_id": 0}).to_list(50)
+    have = {i["service_type"] for i in items}
+    for st, p in DEFAULT_PRICES.items():
+        if st not in have:
+            items.append({"service_type": st, "base_price": p, "default": True})
+    return items
+
+
+@api.post("/pricing")
+async def upsert_pricing(data: PricingIn, user=Depends(require_roles("admin"))):
+    await db.service_prices.update_one({"service_type": data.service_type}, {"$set": data.model_dump()}, upsert=True)
+    return await db.service_prices.find_one({"service_type": data.service_type}, {"_id": 0})
+
+
+# ---------- Customer history & loyalty ----------
+@api.get("/customers")
+async def list_customers(user=Depends(require_roles("reception", "admin"))):
+    return await db.users.find({"role": "customer"}, {"_id": 0, "password_hash": 0}).to_list(500)
+
+
+@api.get("/customers/{customer_id}/history")
+async def customer_history(customer_id: str, user=Depends(get_current_user)):
+    if user["role"] == "customer" and user["id"] != customer_id:
+        raise HTTPException(403, "Forbidden")
+    cust = await db.users.find_one({"id": customer_id}, {"_id": 0, "password_hash": 0})
+    if not cust:
+        raise HTTPException(404, "Not found")
+    bookings = await db.bookings.find({"customer_id": customer_id}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    return {"customer": cust, "bookings": bookings,
+            "total_spent": cust.get("total_spent", 0),
+            "loyalty_tier": cust.get("loyalty_tier", "BRONZE"),
+            "discount_pct": LOYALTY_DISCOUNT.get(cust.get("loyalty_tier", "BRONZE"), 0)}
+
+
+# ---------- Staff management ----------
+@api.get("/admin/staff")
+async def list_staff(user=Depends(require_roles("admin"))):
+    return await db.users.find({"role": {"$in": ["mechanic", "reception", "tester", "admin"]}}, {"_id": 0, "password_hash": 0}).to_list(500)
+
+
+@api.post("/admin/staff")
+async def create_staff(data: StaffCreate, user=Depends(require_roles("admin"))):
+    if data.role not in ("mechanic", "reception", "tester", "admin"):
+        raise HTTPException(400, "Invalid role")
+    if await db.users.find_one({"phone": data.phone}):
+        raise HTTPException(400, "Phone already registered")
+    tmp = uuid.uuid4().hex[:8]
+    doc = {"id": str(uuid.uuid4()), "username": data.phone, "name": data.name,
+           "phone": data.phone, "role": data.role,
+           "password_hash": await hash_password(tmp),
+           "active": True, "created_at": now_iso()}
+    await db.users.insert_one(dict(doc))
+    reset_token = uuid.uuid4().hex
+    await db.password_resets.insert_one({"token": reset_token, "user_id": doc["id"], "ts": now_iso()})
+    link = f"{os.environ.get('PUBLIC_URL','')}/reset?token={reset_token}"
+    await TwilioAdapter.send_sms(data.phone, f"MacJit: Welcome {data.name}! Set your password: {link}  (Temp: {tmp})")
+    doc.pop("password_hash", None)
+    return {**doc, "temp_password": tmp, "reset_link": link}
+
+
+@api.patch("/admin/staff/{user_id}")
+async def update_staff(user_id: str, data: dict, user=Depends(require_roles("admin"))):
+    data.pop("_id", None); data.pop("id", None); data.pop("password_hash", None)
+    await db.users.update_one({"id": user_id}, {"$set": data})
+    return await db.users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0})
+
+
+# ---------- Bulk inventory ----------
+@api.post("/inventory/bulk")
+async def bulk_inventory(data: BulkInventory, user=Depends(require_roles("admin", "reception"))):
+    created = []
+    for it in data.items:
+        item = {"id": str(uuid.uuid4()), **it.model_dump(),
+                "stocked_at": it.stocked_at or now_iso(),
+                "created_at": now_iso()}
+        await db.inventory.insert_one(dict(item))
+        item.pop("_id", None)
+        created.append(item)
+    return {"created": len(created), "items": created}
+
+
+# ---------- Bulk inventory file upload (CSV / XLSX) ----------
+@api.post("/inventory/bulk-upload")
+async def bulk_inventory_upload(file: UploadFile = File(...),
+                                user=Depends(require_roles("admin", "reception"))):
+    """Accepts .csv or .xlsx with columns:
+       name, sku, category, price, stock, low_stock_threshold (optional)
+       Upserts by SKU: if SKU exists, it adds to stock; otherwise creates new.
+    """
+    import io, csv
+    filename = (file.filename or "").lower()
+    raw = await file.read()
+    rows: List[dict] = []
+    try:
+        if filename.endswith(".csv"):
+            text = raw.decode("utf-8-sig", errors="replace")
+            reader = csv.DictReader(io.StringIO(text))
+            rows = [r for r in reader]
+        elif filename.endswith(".xlsx") or filename.endswith(".xls"):
+            from openpyxl import load_workbook
+            wb = load_workbook(io.BytesIO(raw), data_only=True)
+            ws = wb.active
+            it = ws.iter_rows(values_only=True)
+            headers = [str(h or "").strip().lower() for h in next(it)]
+            for vals in it:
+                if not any(v not in (None, "") for v in vals):
+                    continue
+                rows.append({headers[i]: (vals[i] if i < len(vals) else "") for i in range(len(headers))})
+        else:
+            raise HTTPException(400, "Unsupported file. Use .csv or .xlsx")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"Could not parse file: {e}")
+
+    REQUIRED = {"name", "sku", "category", "price", "stock"}
+    added, updated, errors = 0, 0, []
+    for idx, r in enumerate(rows, start=2):  # row 1 is header
+        norm = {(k or "").strip().lower(): v for k, v in r.items()}
+        missing = [k for k in REQUIRED if not str(norm.get(k, "")).strip()]
+        if missing:
+            errors.append({"row": idx, "error": f"Missing: {', '.join(missing)}"})
+            continue
+        try:
+            payload = {
+                "name": str(norm["name"]).strip(),
+                "sku": str(norm["sku"]).strip().upper(),
+                "category": str(norm["category"]).strip(),
+                "price": float(norm["price"]),
+                "stock": int(float(norm["stock"])),
+                "low_stock_threshold": int(float(norm.get("low_stock_threshold") or 5)),
+            }
+        except (ValueError, TypeError) as e:
+            errors.append({"row": idx, "error": f"Invalid value: {e}"})
+            continue
+        existing = await db.inventory.find_one({"sku": payload["sku"]}, {"_id": 0})
+        if existing:
+            await db.inventory.update_one(
+                {"id": existing["id"]},
+                {"$inc": {"stock": payload["stock"]},
+                 "$set": {"name": payload["name"], "category": payload["category"],
+                          "price": payload["price"],
+                          "low_stock_threshold": payload["low_stock_threshold"]}})
+            updated += 1
+        else:
+            doc = {"id": str(uuid.uuid4()), **payload,
+                   "stocked_at": now_iso(), "created_at": now_iso()}
+            await db.inventory.insert_one(doc)
+            added += 1
+    return {"added": added, "updated": updated, "errors": errors,
+            "total_rows": len(rows)}
+
+
+# ---------- Public Enquiries ----------
+@api.post("/enquiries")
+async def create_enquiry(data: EnquiryIn):
+    doc = {"id": str(uuid.uuid4()), **data.model_dump(),
+           "status": "new", "created_at": now_iso()}
+    await db.enquiries.insert_one(dict(doc))
+    doc.pop("_id", None)
+    # Notify admin via SMS (if Twilio configured)
+    admins = await db.users.find({"role": "admin"}, {"_id": 0}).to_list(10)
+    for a in admins:
+        if a.get("phone"):
+            await TwilioAdapter.send_sms(
+                a["phone"],
+                f"MacJit enquiry from {data.name} ({data.phone}): "
+                f"{(data.car_make or '')} {(data.car_model or '')} - "
+                f"{(data.service_interest or 'general')}"
+            )
+    return doc
+
+
+@api.get("/enquiries")
+async def list_enquiries(user=Depends(require_roles("admin", "reception"))):
+    items = await db.enquiries.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    return items
+
+
+@api.patch("/enquiries/{enq_id}")
+async def update_enquiry(enq_id: str, data: dict, user=Depends(require_roles("admin", "reception"))):
+    data.pop("_id", None); data.pop("id", None)
+    await db.enquiries.update_one({"id": enq_id}, {"$set": data})
+    return await db.enquiries.find_one({"id": enq_id}, {"_id": 0})
+
+
+# ---------- INVENTORY ----------
+@api.get("/inventory")
+async def list_inventory(user=Depends(get_current_user)):
+    items = await db.inventory.find({}, {"_id": 0}).to_list(1000)
+    items.sort(key=lambda x: x.get("stocked_at") or "")
+    return items
+
+
+@api.post("/inventory")
+async def create_inventory(data: InventoryIn, user=Depends(require_roles("admin", "reception"))):
+    item = {"id": str(uuid.uuid4()), **data.model_dump(),
+            "stocked_at": data.stocked_at or now_iso(),
+            "created_at": now_iso()}
+    await db.inventory.insert_one(dict(item))
+    item.pop("_id", None)
+    return item
+
+
+@api.patch("/inventory/{item_id}")
+async def update_inventory(item_id: str, data: dict, user=Depends(require_roles("admin", "reception"))):
+    data.pop("_id", None); data.pop("id", None)
+    await db.inventory.update_one({"id": item_id}, {"$set": data})
+    return await db.inventory.find_one({"id": item_id}, {"_id": 0})
+
+
+@api.delete("/inventory/{item_id}")
+async def delete_inventory(item_id: str, user=Depends(require_roles("admin"))):
+    await db.inventory.delete_one({"id": item_id})
+    return {"ok": True}
+
+
+@api.get("/inventory/alerts")
+async def inventory_alerts(user=Depends(require_roles("admin", "reception"))):
+    items = await db.inventory.find({}, {"_id": 0}).to_list(1000)
+    out_of_stock = [i for i in items if i["stock"] <= 0]
+    low_stock = [i for i in items if 0 < i["stock"] <= i.get("low_stock_threshold", 5)]
+    items.sort(key=lambda x: x.get("stocked_at") or "")
+    by_sku: Dict[str, list] = {}
+    for i in items:
+        by_sku.setdefault(i["sku"], []).append(i)
+    fifo = []
+    for sku, group in by_sku.items():
+        if len(group) > 1:
+            fifo.append({"sku": sku, "use_first": group[0]["name"],
+                         "stocked_at": group[0].get("stocked_at"), "id": group[0]["id"]})
+    # not-sold-in-N-days alert
+    threshold_days = 30
+    now = datetime.now(timezone.utc)
+    used_recently = set()
+    async for b in db.bookings.find({"paid_at": {"$ne": None}}, {"_id": 0, "items": 1, "paid_at": 1}):
+        try:
+            paid = datetime.fromisoformat(b["paid_at"])
+            if (now - paid).days <= threshold_days:
+                for it in b.get("items", []):
+                    used_recently.add(it.get("inventory_id"))
+        except Exception:
+            pass
+    stagnant = [i for i in items if i["stock"] > 0 and i["id"] not in used_recently]
+    return {"out_of_stock": out_of_stock, "low_stock": low_stock,
+            "fifo": fifo, "stagnant": stagnant[:10],
+            "stagnant_threshold_days": threshold_days}
+
+
+# ---------- NOTIFICATIONS ----------
+@api.get("/notifications/me")
+async def my_notifications(user=Depends(get_current_user)):
+    return await db.notifications.find({"user_id": user["id"]}, {"_id": 0}).sort("ts", -1).limit(50).to_list(50)
+
+
+@api.post("/notifications/{notif_id}/read")
+async def mark_read(notif_id: str, user=Depends(get_current_user)):
+    await db.notifications.update_one({"id": notif_id, "user_id": user["id"]}, {"$set": {"read": True}})
+    return {"ok": True}
+
+
+# ---------- ADMIN ----------
+@api.get("/admin/stats")
+async def admin_stats(user=Depends(require_roles("admin", "reception"))):
+    today = datetime.now(timezone.utc).date().isoformat()
+    all_bookings = await db.bookings.find({}, {"_id": 0}).to_list(2000)
+    today_done = [b for b in all_bookings if (b.get("paid_at") or "").startswith(today)]
+    revenue_today = sum(b.get("bill_amount", 0) for b in today_done)
+    by_status = {}
+    for b in all_bookings:
+        by_status[b["status"]] = by_status.get(b["status"], 0) + 1
+    last_7 = []
+    for i in range(6, -1, -1):
+        d = (datetime.now(timezone.utc).date() - timedelta(days=i)).isoformat()
+        day_bs = [b for b in all_bookings if (b.get("paid_at") or "").startswith(d)]
+        last_7.append({"date": d, "serviced": len(day_bs),
+                       "revenue": sum(b.get("bill_amount", 0) for b in day_bs)})
+    inv = await db.inventory.find({}, {"_id": 0}).to_list(1000)
+    return {
+        "today_serviced": len(today_done),
+        "today_revenue": revenue_today,
+        "active_bays": sum(1 for b in all_bookings if b["status"] == "IN_SERVICE"),
+        "total_bookings": len(all_bookings),
+        "by_status": by_status,
+        "last_7_days": last_7,
+        "low_stock_count": sum(1 for i in inv if 0 < i["stock"] <= i.get("low_stock_threshold", 5)),
+        "out_of_stock_count": sum(1 for i in inv if i["stock"] <= 0),
+    }
+
+
+# ---------- HR MODULE ----------
+DEFAULT_LEAVE_BALANCE = {"casual": 12, "earned": 15, "sick": 8}
+STAFF_ROLES = {"mechanic", "reception", "tester", "admin", "shopkeeper"}
+
+
+def _staff_user(user):
+    if user["role"] not in STAFF_ROLES:
+        raise HTTPException(403, "Staff only")
+
+
+@api.post("/hr/leaves")
+async def apply_leave(data: LeaveIn, user=Depends(get_current_user)):
+    _staff_user(user)
+    rec = {"id": str(uuid.uuid4()), "user_id": user["id"], "user_name": user["name"],
+           "user_role": user["role"], **data.model_dump(),
+           "status": "PENDING", "created_at": now_iso(),
+           "decided_at": None, "decided_by": None, "decision_note": None}
+    await db.leaves.insert_one(dict(rec))
+    rec.pop("_id", None)
+    # notify all admins
+    admin_ids = [u["id"] async for u in db.users.find({"role": "admin"}, {"_id": 0, "id": 1})]
+    await bus.fanout(admin_ids, {"type": "LEAVE_REQUESTED", "data": rec, "ts": now_iso()})
+    for aid in admin_ids:
+        await db.notifications.insert_one({
+            "id": str(uuid.uuid4()), "user_id": aid, "event_type": "LEAVE_REQUESTED",
+            "title": "Leave Request", "body": f"{user['name']} applied for {data.leave_type} leave",
+            "read": False, "ts": now_iso(), "ref_id": rec["id"]
+        })
+    return rec
+
+
+@api.get("/hr/leaves/me")
+async def my_leaves(user=Depends(get_current_user)):
+    _staff_user(user)
+    return await db.leaves.find({"user_id": user["id"]}, {"_id": 0}).sort("created_at", -1).to_list(200)
+
+
+@api.get("/hr/leaves")
+async def all_leaves(status: Optional[str] = None, user=Depends(require_roles("admin"))):
+    q = {}
+    if status:
+        q["status"] = status.upper()
+    return await db.leaves.find(q, {"_id": 0}).sort("created_at", -1).to_list(500)
+
+
+@api.patch("/hr/leaves/{leave_id}")
+async def decide_leave(leave_id: str, data: LeaveDecision, user=Depends(require_roles("admin"))):
+    decision = data.decision.upper()
+    if decision not in ("APPROVED", "REJECTED"):
+        raise HTTPException(400, "Invalid decision")
+    await db.leaves.update_one({"id": leave_id}, {"$set": {
+        "status": decision, "decided_at": now_iso(),
+        "decided_by": user["name"], "decision_note": data.note
+    }})
+    rec = await db.leaves.find_one({"id": leave_id}, {"_id": 0})
+    # notify employee
+    await bus.fanout([rec["user_id"]], {"type": f"LEAVE_{decision}", "data": rec, "ts": now_iso()})
+    await db.notifications.insert_one({
+        "id": str(uuid.uuid4()), "user_id": rec["user_id"], "event_type": f"LEAVE_{decision}",
+        "title": f"Leave {decision.title()}",
+        "body": f"Your {rec['leave_type']} leave was {decision.lower()}",
+        "read": False, "ts": now_iso(), "ref_id": leave_id
+    })
+    return rec
+
+
+# ---------- Attendance ----------
+@api.post("/hr/attendance/punch")
+async def punch(user=Depends(get_current_user)):
+    _staff_user(user)
+    today = datetime.now(timezone.utc).date().isoformat()
+    rec = await db.attendance.find_one({"user_id": user["id"], "date": today})
+    now = now_iso()
+    if not rec:
+        doc = {"id": str(uuid.uuid4()), "user_id": user["id"], "user_name": user["name"],
+               "date": today, "punch_in": now, "punch_out": None}
+        await db.attendance.insert_one(dict(doc))
+        doc.pop("_id", None)
+        return doc
+    if not rec.get("punch_out"):
+        await db.attendance.update_one({"id": rec["id"]}, {"$set": {"punch_out": now}})
+    return await db.attendance.find_one({"id": rec["id"]}, {"_id": 0})
+
+
+@api.get("/hr/attendance/me")
+async def my_attendance(user=Depends(get_current_user)):
+    _staff_user(user)
+    return await db.attendance.find({"user_id": user["id"]}, {"_id": 0}).sort("date", -1).limit(60).to_list(60)
+
+
+@api.get("/hr/attendance/all")
+async def all_attendance(date: Optional[str] = None, user=Depends(require_roles("admin"))):
+    q = {"date": date} if date else {}
+    return await db.attendance.find(q, {"_id": 0}).sort("date", -1).to_list(500)
+
+
+# ---------- Holidays ----------
+@api.get("/hr/holidays")
+async def list_holidays(user=Depends(get_current_user)):
+    return await db.holidays.find({}, {"_id": 0}).sort("date", 1).to_list(200)
+
+
+@api.post("/hr/holidays")
+async def add_holiday(data: HolidayIn, user=Depends(require_roles("admin"))):
+    doc = {"id": str(uuid.uuid4()), **data.model_dump(), "created_at": now_iso()}
+    await db.holidays.insert_one(dict(doc))
+    doc.pop("_id", None)
+    return doc
+
+
+@api.delete("/hr/holidays/{hid}")
+async def del_holiday(hid: str, user=Depends(require_roles("admin"))):
+    await db.holidays.delete_one({"id": hid})
+    return {"ok": True}
+
+
+# ---------- Employee Profile ----------
+@api.get("/hr/profile/me")
+async def my_profile(user=Depends(get_current_user)):
+    _staff_user(user)
+    profile = await db.profiles.find_one({"user_id": user["id"]}, {"_id": 0}) or {}
+    bal = profile.get("leave_balance") or DEFAULT_LEAVE_BALANCE
+    used = {"casual": 0, "earned": 0, "sick": 0, "unpaid": 0}
+    async for l in db.leaves.find({"user_id": user["id"], "status": "APPROVED"}, {"_id": 0}):
+        try:
+            days = (datetime.fromisoformat(l["end_date"]).date() - datetime.fromisoformat(l["start_date"]).date()).days + 1
+            used[l["leave_type"]] = used.get(l["leave_type"], 0) + max(1, days)
+        except Exception:
+            pass
+    timeline = await db.payroll_events.find({"user_id": user["id"]}, {"_id": 0}).sort("ts", -1).limit(50).to_list(50)
+    return {"user": {k: v for k, v in user.items() if k != "password_hash"},
+            "profile": profile, "leave_balance": bal, "leave_used": used,
+            "timeline": timeline}
+
+
+@api.patch("/hr/profile/{user_id}")
+async def update_profile(user_id: str, data: ProfileUpdate, user=Depends(require_roles("admin"))):
+    upd = {k: v for k, v in data.model_dump().items() if v is not None}
+    upd["user_id"] = user_id
+    await db.profiles.update_one({"user_id": user_id}, {"$set": upd}, upsert=True)
+    return await db.profiles.find_one({"user_id": user_id}, {"_id": 0})
+
+
+@api.post("/hr/payroll/event")
+async def add_payroll_event(data: BonusIn, user=Depends(require_roles("admin"))):
+    target = await db.users.find_one({"id": data.user_id}, {"_id": 0})
+    if not target:
+        raise HTTPException(404, "Employee not found")
+    doc = {"id": str(uuid.uuid4()), "user_id": data.user_id, "user_name": target["name"],
+           "amount": data.amount, "reason": data.reason, "event_type": data.event_type,
+           "by": user["name"], "ts": now_iso()}
+    await db.payroll_events.insert_one(dict(doc))
+    doc.pop("_id", None)
+    await bus.fanout([data.user_id], {"type": f"PAYROLL_{data.event_type.upper()}", "data": doc, "ts": now_iso()})
+    await db.notifications.insert_one({
+        "id": str(uuid.uuid4()), "user_id": data.user_id,
+        "event_type": f"PAYROLL_{data.event_type.upper()}",
+        "title": data.event_type.replace("_", " ").title(),
+        "body": f"₹{data.amount} · {data.reason}",
+        "read": False, "ts": now_iso()
+    })
+    return doc
+
+
+@api.get("/hr/profile/{user_id}")
+async def admin_view_profile(user_id: str, user=Depends(require_roles("admin"))):
+    profile = await db.profiles.find_one({"user_id": user_id}, {"_id": 0}) or {}
+    target = await db.users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0})
+    timeline = await db.payroll_events.find({"user_id": user_id}, {"_id": 0}).sort("ts", -1).limit(50).to_list(50)
+    return {"user": target, "profile": profile, "timeline": timeline}
+
+
+# ---------- SHOP MODULE (walk-in parts counter, shares inventory) ----------
+@api.post("/shop/sales")
+async def create_sale(data: ShopSaleIn, user=Depends(require_roles("shopkeeper", "admin", "reception"))):
+    if not data.items:
+        raise HTTPException(400, "Cart empty")
+    lines = []
+    total = 0.0
+    for line in data.items:
+        inv = await db.inventory.find_one({"id": line.inventory_id})
+        if not inv:
+            raise HTTPException(404, f"Item not found: {line.inventory_id}")
+        if inv["stock"] < line.qty:
+            raise HTTPException(400, f"Insufficient stock for {inv['name']}")
+        subtotal = inv["price"] * line.qty
+        lines.append({"inventory_id": inv["id"], "name": inv["name"], "sku": inv["sku"],
+                      "qty": line.qty, "price": inv["price"], "subtotal": subtotal})
+        total += subtotal
+        await db.inventory.update_one({"id": inv["id"]}, {"$inc": {"stock": -line.qty}})
+
+    sale_id = str(uuid.uuid4())
+    payment_link = None
+    if data.payment_method == "razorpay":
+        payment_link = await RazorpayAdapter.create_payment_link(total, sale_id, data.customer_phone or "")
+
+    sale = {
+        "id": sale_id,
+        "customer_name": data.customer_name or "Walk-in",
+        "customer_phone": data.customer_phone or "",
+        "items": lines, "total": total,
+        "payment_method": data.payment_method,
+        "payment_link": payment_link,
+        "paid": data.payment_method == "cash",  # cash assumed paid at counter
+        "shopkeeper_id": user["id"], "shopkeeper_name": user["name"],
+        "created_at": now_iso(),
+        "paid_at": now_iso() if data.payment_method == "cash" else None,
+    }
+    await db.shop_sales.insert_one(dict(sale))
+    sale.pop("_id", None)
+    if data.customer_phone:
+        await TwilioAdapter.send_sms(data.customer_phone,
+            f"MacJit bill #{sale_id[:8]} ₹{total}. {payment_link if payment_link else 'Paid at counter.'} Thanks!")
+    # notify admin
+    admin_ids = [u["id"] async for u in db.users.find({"role": "admin"}, {"_id": 0, "id": 1})]
+    await bus.fanout(admin_ids, {"type": "SHOP_SALE", "data": sale, "ts": now_iso()})
+    return sale
+
+
+@api.post("/shop/sales/{sale_id}/pay")
+async def mark_sale_paid(sale_id: str, user=Depends(require_roles("shopkeeper", "admin", "reception"))):
+    await db.shop_sales.update_one({"id": sale_id}, {"$set": {"paid": True, "paid_at": now_iso()}})
+    return await db.shop_sales.find_one({"id": sale_id}, {"_id": 0})
+
+
+@api.get("/shop/sales")
+async def list_sales(user=Depends(require_roles("shopkeeper", "admin", "reception"))):
+    return await db.shop_sales.find({}, {"_id": 0}).sort("created_at", -1).to_list(200)
+
+
+@api.get("/shop/stats")
+async def shop_stats(user=Depends(require_roles("shopkeeper", "admin", "reception"))):
+    today = datetime.now(timezone.utc).date().isoformat()
+    sales = await db.shop_sales.find({}, {"_id": 0}).to_list(2000)
+    today_sales = [s for s in sales if (s.get("created_at") or "").startswith(today)]
+    today_paid = [s for s in today_sales if s.get("paid")]
+    last_7 = []
+    for i in range(6, -1, -1):
+        d = (datetime.now(timezone.utc).date() - timedelta(days=i)).isoformat()
+        day = [s for s in sales if (s.get("created_at") or "").startswith(d) and s.get("paid")]
+        last_7.append({"date": d, "sales": len(day), "revenue": sum(s.get("total", 0) for s in day)})
+    # Top fast-movers (last 7 days, by units sold)
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    movers = {}
+    for s in sales:
+        if (s.get("created_at") or "") < cutoff:
+            continue
+        for it in s.get("items", []):
+            k = it.get("inventory_id")
+            if k not in movers:
+                movers[k] = {"inventory_id": k, "name": it["name"], "sku": it["sku"], "units": 0, "revenue": 0}
+            movers[k]["units"] += it.get("qty", 0)
+            movers[k]["revenue"] += it.get("subtotal", 0)
+    fast_movers = sorted(movers.values(), key=lambda x: x["units"], reverse=True)[:5]
+    return {
+        "today_count": len(today_sales),
+        "today_revenue": sum(s.get("total", 0) for s in today_paid),
+        "pending_count": sum(1 for s in sales if not s.get("paid")),
+        "last_7_days": last_7,
+        "total_sales": len(sales),
+        "fast_movers": fast_movers,
+    }
+
+
+# ---------- Mechanic photo capture (live progress photos) ----------
+@api.post("/bookings/{booking_id}/photos")
+async def upload_photo(booking_id: str, data: dict, user=Depends(require_roles("mechanic"))):
+    """Accepts {data_url: 'data:image/jpeg;base64,...', caption?: ''} and stores."""
+    data_url = data.get("data_url", "")
+    if not data_url.startswith("data:image"):
+        raise HTTPException(400, "Invalid image data")
+    if len(data_url) > 2_500_000:  # ~2.5MB cap
+        raise HTTPException(400, "Image too large (max 2MB)")
+    photo = {
+        "id": str(uuid.uuid4()),
+        "booking_id": booking_id,
+        "data_url": data_url,
+        "caption": data.get("caption", ""),
+        "captured_by": user["name"],
+        "ts": now_iso(),
+    }
+    await db.service_photos.insert_one(dict(photo))
+    photo.pop("_id", None)
+    b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+    if b:
+        recipients = await get_recipients_for_booking(b, include_admin=False)
+        await bus.fanout(recipients, {"type": "PHOTO_CAPTURED", "data": {"booking_id": booking_id, "ts": photo["ts"]}, "ts": now_iso()})
+    return {"id": photo["id"], "ts": photo["ts"]}
+
+
+@api.get("/bookings/{booking_id}/photos")
+async def list_photos(booking_id: str, user=Depends(get_current_user)):
+    b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+    if not b:
+        raise HTTPException(404, "Not found")
+    if user["role"] == "customer" and b.get("customer_id") != user["id"]:
+        raise HTTPException(403, "Forbidden")
+    return await db.service_photos.find({"booking_id": booking_id}, {"_id": 0}).sort("ts", -1).to_list(50)
+
+
+
+# ---------- WebSocket ----------
+@app.websocket("/api/ws/{token}")
+async def websocket_endpoint(websocket: WebSocket, token: str):
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+        user_id = payload["sub"]
+    except jwt.PyJWTError:
+        await websocket.close(code=1008)
+        return
+    await websocket.accept()
+    q = await bus.subscribe(user_id)
+    try:
+        await websocket.send_json({"type": "connected", "user_id": user_id})
+        while True:
+            event = await q.get()
+            await websocket.send_json(event)
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.warning(f"ws error: {e}")
+    finally:
+        bus.unsubscribe(user_id, q)
+
+
+# ---------- Seeding ----------
+DEMO_USERS = [
+    {"username": "9353401156", "password": "macjit@123", "name": "Prashant Tiwary", "role": "admin", "phone": "+919353401156"},
+]
+
+DEMO_BAYS = [
+    {"id": "bay-1", "name": "Bay A1", "type": "general"},
+    {"id": "bay-2", "name": "Bay A2", "type": "general"},
+    {"id": "bay-3", "name": "Bay B1", "type": "engine"},
+    {"id": "bay-4", "name": "Bay B2", "type": "tire"},
+]
+
+DEMO_INVENTORY = [
+    {"name": "Engine Oil 5W-30 Synthetic 4L (Castrol)", "sku": "OIL-CST-4L-5W30", "category": "Lubricants", "price": 2400, "stock": 18, "low_stock_threshold": 6,
+     "stocked_at": (datetime.now(timezone.utc) - timedelta(days=20)).isoformat(),
+     "expiry_at": (datetime.now(timezone.utc) + timedelta(days=540)).isoformat()},
+    {"name": "Engine Oil 0W-20 Synthetic 4L (Mobil1)", "sku": "OIL-MBL-4L-0W20", "category": "Lubricants", "price": 3200, "stock": 10, "low_stock_threshold": 4,
+     "stocked_at": (datetime.now(timezone.utc) - timedelta(days=15)).isoformat(),
+     "expiry_at": (datetime.now(timezone.utc) + timedelta(days=600)).isoformat()},
+    {"name": "Oil Filter (Bosch)", "sku": "FLT-OIL-BSH", "category": "Filters", "price": 480, "stock": 22, "low_stock_threshold": 6,
+     "stocked_at": (datetime.now(timezone.utc) - timedelta(days=12)).isoformat()},
+    {"name": "Air Filter (Bosch)", "sku": "FLT-AIR-BSH", "category": "Filters", "price": 620, "stock": 14, "low_stock_threshold": 5,
+     "stocked_at": (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()},
+    {"name": "Cabin AC Filter (carbon)", "sku": "FLT-AC-CRB", "category": "Filters", "price": 850, "stock": 9, "low_stock_threshold": 4,
+     "stocked_at": (datetime.now(timezone.utc) - timedelta(days=18)).isoformat()},
+    {"name": "Front Brake Pad Set (Bosch)", "sku": "BRK-PAD-FRT", "category": "Brakes", "price": 1850, "stock": 6, "low_stock_threshold": 3,
+     "stocked_at": (datetime.now(timezone.utc) - timedelta(days=22)).isoformat()},
+    {"name": "Rear Brake Shoe Set", "sku": "BRK-SHOE-RR", "category": "Brakes", "price": 1450, "stock": 4, "low_stock_threshold": 3,
+     "stocked_at": (datetime.now(timezone.utc) - timedelta(days=25)).isoformat()},
+    {"name": "Brake Fluid DOT-4 1L", "sku": "FLD-BRK-DOT4", "category": "Fluids", "price": 380, "stock": 16, "low_stock_threshold": 5,
+     "stocked_at": (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()},
+    {"name": "Coolant 5L (pre-mix)", "sku": "COL-5L", "category": "Fluids", "price": 950, "stock": 12, "low_stock_threshold": 4,
+     "stocked_at": (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()},
+    {"name": "Wiper Blade Set 22\"+18\"", "sku": "WIP-22-18", "category": "Wipers", "price": 850, "stock": 8, "low_stock_threshold": 4,
+     "stocked_at": (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()},
+    {"name": "12V 65Ah Battery (Exide)", "sku": "BAT-EXD-65", "category": "Battery", "price": 7200, "stock": 5, "low_stock_threshold": 2,
+     "stocked_at": (datetime.now(timezone.utc) - timedelta(days=18)).isoformat()},
+    {"name": "Spark Plug Set of 4 (NGK Iridium)", "sku": "SPK-NGK-IR-4", "category": "Ignition", "price": 1600, "stock": 12, "low_stock_threshold": 4,
+     "stocked_at": (datetime.now(timezone.utc) - timedelta(days=11)).isoformat()},
+    {"name": "AC Refrigerant Gas R-1234yf 250g", "sku": "AC-GAS-R1234", "category": "AC", "price": 2800, "stock": 6, "low_stock_threshold": 3,
+     "stocked_at": (datetime.now(timezone.utc) - timedelta(days=20)).isoformat()},
+    {"name": "Tyre 195/55 R16 (Apollo)", "sku": "TYR-195-55-16", "category": "Tyres", "price": 7200, "stock": 8, "low_stock_threshold": 4,
+     "stocked_at": (datetime.now(timezone.utc) - timedelta(days=25)).isoformat()},
+]
+
+
+@app.on_event("startup")
+async def startup():
+    # One-time cleanup: remove any old hard-coded demo accounts from earlier seeds
+    OLD_DEMO_USERNAMES = ["customer", "customer2", "reception", "mechanic",
+                          "mechanic2", "tester", "admin", "shopkeeper"]
+    deleted = await db.users.delete_many({"username": {"$in": OLD_DEMO_USERNAMES}})
+    if deleted.deleted_count:
+        logger.info(f"Cleaned up {deleted.deleted_count} legacy demo users")
+    # One-time cleanup: remove old 2-wheeler demo inventory
+    OLD_INV_SKUS = ["OIL-CST-1L", "BRK-PAD-01", "FLT-AIR-01", "SPK-NGK-01",
+                    "CHN-LUB-01", "TYR-90-17", "COL-500"]
+    inv_del = await db.inventory.delete_many({"sku": {"$in": OLD_INV_SKUS}})
+    if inv_del.deleted_count:
+        logger.info(f"Cleaned up {inv_del.deleted_count} legacy 2-wheeler inventory items")
+    # Idempotently seed/upgrade demo users (force admin role + correct password hash)
+    for u in DEMO_USERS:
+        existing = await db.users.find_one({"username": u["username"]})
+        h = await hash_password(u["password"])
+        if existing:
+            await db.users.update_one(
+                {"id": existing["id"]},
+                {"$set": {"name": u["name"], "role": u["role"], "phone": u["phone"],
+                          "password_hash": h}}
+            )
+            logger.info(f"Upgraded existing user {u['username']} to {u['role']}")
+        else:
+            doc = {"id": str(uuid.uuid4()), "username": u["username"], "name": u["name"],
+                   "role": u["role"], "phone": u["phone"],
+                   "password_hash": h, "created_at": now_iso()}
+            await db.users.insert_one(doc)
+            logger.info(f"Seeded admin {u['username']}")
+    if await db.bays.count_documents({}) == 0:
+        for b in DEMO_BAYS:
+            await db.bays.insert_one({**b, "created_at": now_iso()})
+        logger.info(f"Seeded {len(DEMO_BAYS)} bays")
+    if await db.inventory.count_documents({}) == 0:
+        for i in DEMO_INVENTORY:
+            await db.inventory.insert_one({"id": str(uuid.uuid4()), **i, "created_at": now_iso()})
+        logger.info(f"Seeded {len(DEMO_INVENTORY)} inventory items")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    client.close()
+
+
+app.include_router(api)
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------- Serve React frontend (production build) ----------
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, JSONResponse
+
+FRONTEND_BUILD = ROOT_DIR.parent / "frontend" / "build"
+if FRONTEND_BUILD.exists():
+    static_dir = FRONTEND_BUILD / "static"
+    if static_dir.exists():
+        app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+    @app.get("/")
+    async def _spa_root():
+        return FileResponse(str(FRONTEND_BUILD / "index.html"))
+
+    @app.get("/{full_path:path}")
+    async def _spa_fallback(full_path: str):
+        if (full_path.startswith("api")
+                or full_path.startswith("ws")
+                or full_path.startswith("__replco")
+                or full_path.startswith("__replit")):
+            return JSONResponse({"detail": "Not Found"}, status_code=404)
+        candidate = FRONTEND_BUILD / full_path
+        if candidate.exists() and candidate.is_file():
+            return FileResponse(str(candidate))
+        return FileResponse(str(FRONTEND_BUILD / "index.html"))
+else:
+    @app.get("/")
+    async def _no_build():
+        return JSONResponse({
+            "status": "backend_only",
+            "message": "Frontend build not found. Run `cd frontend && yarn build`.",
+        })
