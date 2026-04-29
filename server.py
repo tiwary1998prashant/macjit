@@ -98,9 +98,8 @@ class LoginIn(BaseModel):
 
 
 class BookingCreate(BaseModel):
-    customer_id: Optional[str] = None
-    customer_name: Optional[str] = None
-    customer_phone: Optional[str] = None
+    customer_name: str
+    customer_phone: str
     car_make: str
     car_model: str
     plate_number: str
@@ -111,7 +110,8 @@ class BookingCreate(BaseModel):
 class StaffCreate(BaseModel):
     name: str
     phone: str
-    role: str  # mechanic | reception | tester | admin
+    role: str  # mechanic | reception | tester | shopkeeper | admin
+    password: Optional[str] = None  # admin sets initial password; if blank, server generates one
 
 
 class PricingIn(BaseModel):
@@ -412,14 +412,16 @@ async def publish_event(event_type: str, booking: dict, recipients: List[str], e
     await KafkaAdapter.publish("garage.events", event)
     await RabbitAdapter.enqueue(f"queue.{event_type.lower()}", event)
 
-    # Twilio for customer-facing transitions
-    customer_id = booking.get("customer_id")
-    if customer_id and event_type in CUSTOMER_NOTIFY_EVENTS:
-        cust = await db.users.find_one({"id": customer_id}, {"_id": 0})
-        if cust and cust.get("phone"):
-            msg = EVENT_BODIES.get(event_type, "").format(**_ctx)
-            await TwilioAdapter.send_whatsapp(cust["phone"], msg)
-            await TwilioAdapter.send_sms(cust["phone"], msg)
+    # Twilio for customer-facing transitions (read phone directly from booking)
+    customer_phone = booking.get("customer_phone")
+    if customer_phone and event_type in CUSTOMER_NOTIFY_EVENTS:
+        msg = EVENT_BODIES.get(event_type, "").format(**_ctx)
+        # Append a tracking link so the customer can open their bill / status page.
+        public_url = os.environ.get("PUBLIC_URL") or os.environ.get("APP_URL") or ""
+        plate = booking.get("plate_number", "")
+        if public_url and plate:
+            msg += f"\nTrack & pay: {public_url}/track?plate={plate}"
+        await TwilioAdapter.send_whatsapp(customer_phone, msg)
 
 
 EVENT_TITLES = {
@@ -551,9 +553,9 @@ api = APIRouter(prefix="/api")
 
 async def get_recipients_for_booking(booking: dict, include_customer=True, include_admin=True,
                                      include_reception=True, include_mechanic=True, include_tester=False) -> List[str]:
+    """Customers no longer have login accounts so include_customer is now ignored;
+    customer notifications are sent over WhatsApp via Twilio (see publish_event)."""
     ids = []
-    if include_customer and booking.get("customer_id"):
-        ids.append(booking["customer_id"])
     if booking.get("mechanic_id") and include_mechanic:
         ids.append(booking["mechanic_id"])
     role_filter = []
@@ -572,13 +574,34 @@ async def get_recipients_for_booking(booking: dict, include_customer=True, inclu
 # ---------- AUTH ROUTES ----------
 @api.post("/auth/login")
 async def login(data: LoginIn):
+    """Staff-only login (admin / reception / mechanic / tester / shopkeeper).
+    Customers do NOT log in — they track via vehicle number on the public page."""
     q = {"username": data.username} if data.username else {"phone": data.phone}
     user = await db.users.find_one(q)
     if not user or not await verify_password(data.password, user["password_hash"]):
         raise HTTPException(401, "Invalid credentials")
+    if user.get("role") == "customer":
+        raise HTTPException(403, "Customers track bookings on the public page — no login required.")
+    if user.get("active") is False:
+        raise HTTPException(403, "Account disabled. Contact admin.")
     token = make_token(user["id"], user["role"])
     user.pop("_id", None); user.pop("password_hash", None)
-    return {"token": token, "user": user}
+    return {"token": token, "user": user, "must_reset_password": bool(user.get("must_reset_password"))}
+
+
+@api.post("/auth/change-password")
+async def change_password(data: dict, user=Depends(get_current_user)):
+    """Force-reset flow on first login, or voluntary change."""
+    new_pwd = (data.get("new_password") or "").strip()
+    if len(new_pwd) < 6:
+        raise HTTPException(400, "Password must be at least 6 characters")
+    h = await hash_password(new_pwd)
+    await db.users.update_one(
+        {"id": user["id"]},
+        {"$set": {"password_hash": h, "must_reset_password": False},
+         "$unset": {"initial_password": ""}}
+    )
+    return {"ok": True}
 
 
 def _normalize_phone(p: str) -> str:
@@ -596,89 +619,7 @@ def _normalize_phone(p: str) -> str:
     return "+" + digits if digits else p
 
 
-@api.post("/auth/otp/request")
-async def otp_request(data: dict):
-    """Customer-only login. Send a 6-digit OTP to the phone via SMS."""
-    import random
-    phone = _normalize_phone(data.get("phone", ""))
-    if not phone or len(phone) < 10:
-        raise HTTPException(400, "Valid phone number required")
-    code = f"{random.randint(0, 999999):06d}"
-    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
-    # Invalidate any prior unconsumed OTPs for this phone
-    await db.otps.delete_many({"phone": phone, "consumed": False})
-    await db.otps.insert_one({
-        "id": str(uuid.uuid4()),
-        "phone": phone,
-        "code": code,
-        "expires_at": expires_at,
-        "consumed": False,
-        "attempts": 0,
-        "created_at": now_iso(),
-    })
-    msg = f"MacJit: Your login OTP is {code}. Valid for 5 minutes. Do not share."
-    await TwilioAdapter.send_sms(phone, msg)
-    await TwilioAdapter.send_whatsapp(phone, msg)
-    logger.info(f"[OTP] sent to {phone[:6]}***")
-    # Return the code in non-prod when Twilio is mocked, so dev/QA can test.
-    debug_payload = {}
-    if not TwilioAdapter.enabled or not os.environ.get("TWILIO_SMS_FROM"):
-        debug_payload = {"debug_otp": code}
-    return {"ok": True, "expires_in": 300, **debug_payload}
-
-
-@api.post("/auth/otp/verify")
-async def otp_verify(data: dict):
-    """Verify OTP. If user doesn't exist, auto-create as customer. Return JWT."""
-    phone = _normalize_phone(data.get("phone", ""))
-    code = (data.get("otp") or data.get("code") or "").strip()
-    name = (data.get("name") or "").strip()  # optional, used only for new customers
-    if not phone or not code:
-        raise HTTPException(400, "Phone and OTP required")
-
-    rec = await db.otps.find_one({"phone": phone, "consumed": False}, sort=[("created_at", -1)])
-    if not rec:
-        raise HTTPException(400, "OTP not found or already used. Please request a new one.")
-    # Expiry check
-    try:
-        if datetime.fromisoformat(rec["expires_at"]) < datetime.now(timezone.utc):
-            raise HTTPException(400, "OTP expired. Please request a new one.")
-    except (ValueError, TypeError):
-        raise HTTPException(400, "OTP expired. Please request a new one.")
-    # Attempt cap
-    if rec.get("attempts", 0) >= 5:
-        await db.otps.update_one({"id": rec["id"]}, {"$set": {"consumed": True}})
-        raise HTTPException(429, "Too many attempts. Request a new OTP.")
-    if rec["code"] != code:
-        await db.otps.update_one({"id": rec["id"]}, {"$inc": {"attempts": 1}})
-        raise HTTPException(400, "Invalid OTP")
-    # Mark consumed
-    await db.otps.update_one({"id": rec["id"]}, {"$set": {"consumed": True}})
-
-    # Find or create customer
-    user = await db.users.find_one({"phone": phone, "role": "customer"})
-    if not user:
-        # Don't conflict with admin user that has same phone — only auto-create if no user with this phone exists at all
-        any_user = await db.users.find_one({"phone": phone})
-        if any_user:
-            user = any_user
-        else:
-            user = {
-                "id": str(uuid.uuid4()),
-                "username": phone,
-                "name": name or "Customer",
-                "phone": phone,
-                "role": "customer",
-                "password_hash": "",  # OTP-only login
-                "total_spent": 0,
-                "loyalty_tier": "BRONZE",
-                "created_at": now_iso(),
-            }
-            await db.users.insert_one(dict(user))
-            logger.info(f"[OTP] auto-created customer {phone[:6]}***")
-    user.pop("_id", None); user.pop("password_hash", None)
-    token = make_token(user["id"], user["role"])
-    return {"token": token, "user": user}
+# OTP login removed — customers now track via vehicle plate, no auth.
 
 
 
@@ -732,34 +673,31 @@ async def list_bays(user=Depends(get_current_user)):
 # ---------- BOOKINGS ----------
 @api.post("/bookings")
 async def create_booking(data: BookingCreate, user=Depends(require_roles("reception", "admin"))):
-    # Walk-in path: auto-create or match customer by phone
-    if not data.customer_id:
-        if not (data.customer_phone and data.customer_name):
-            raise HTTPException(400, "Provide customer_id OR (customer_name + customer_phone)")
-        existing = await db.users.find_one({"phone": data.customer_phone, "role": "customer"})
-        if existing:
-            customer = existing
-        else:
-            cid = str(uuid.uuid4())
-            tmp_pwd = uuid.uuid4().hex[:8]
-            customer = {
-                "id": cid, "username": data.customer_phone, "name": data.customer_name,
-                "phone": data.customer_phone, "role": "customer",
-                "password_hash": await hash_password(tmp_pwd),
-                "total_spent": 0, "loyalty_tier": "BRONZE",
-                "created_at": now_iso(),
-            }
-            await db.users.insert_one(dict(customer))
-            await TwilioAdapter.send_sms(data.customer_phone,
-                f"Welcome to MacJit! Login: {data.customer_phone} Pwd: {tmp_pwd}")
-    else:
-        customer = await db.users.find_one({"id": data.customer_id, "role": "customer"})
-        if not customer:
-            raise HTTPException(404, "Customer not found")
+    """Walk-in booking. Customers do NOT log in — we just keep their name/phone on the booking
+    and they track everything via the public /track page using the vehicle plate number."""
+    if not (data.customer_phone and data.customer_name):
+        raise HTTPException(400, "customer_name and customer_phone are required")
+    customer_phone = _normalize_phone(data.customer_phone)
+    # Look up loyalty info from prior bookings (no user account needed)
+    prior = await db.bookings.aggregate([
+        {"$match": {"customer_phone": customer_phone, "paid": True}},
+        {"$group": {"_id": None, "total": {"$sum": "$bill_amount"}}}
+    ]).to_list(1)
+    total_spent = (prior[0]["total"] if prior else 0)
+    tier = "GOLD" if total_spent >= 25000 else ("SILVER" if total_spent >= 10000 else "BRONZE")
+    customer = {
+        "id": f"walkin-{customer_phone}",
+        "name": data.customer_name,
+        "phone": customer_phone,
+        "loyalty_tier": tier,
+        "total_spent": total_spent,
+    }
     booking = {
         "id": str(uuid.uuid4()),
         "customer_id": customer["id"],
         "customer_name": customer["name"],
+        "customer_phone": customer["phone"],
+        "loyalty_tier": tier,
         "car_make": data.car_make,
         "car_model": data.car_model,
         "plate_number": data.plate_number,
@@ -811,9 +749,7 @@ async def list_bookings(status: Optional[str] = None, user=Depends(get_current_u
     q = {}
     if status:
         q["status"] = status
-    if user["role"] == "customer":
-        q["customer_id"] = user["id"]
-    elif user["role"] == "mechanic":
+    if user["role"] == "mechanic":
         q["mechanic_id"] = user["id"]
     elif user["role"] == "tester":
         q["status"] = {"$in": ["READY_TO_TEST", "QA_DONE", "BILLED", "PAID"]}
@@ -905,10 +841,14 @@ async def request_approval(booking_id: str, data: ApprovalReq, user=Depends(requ
 
 
 @api.post("/bookings/{booking_id}/approve")
-async def approve(booking_id: str, user=Depends(require_roles("customer"))):
+async def approve(booking_id: str, data: Optional[dict] = None):
+    """Public approval — customer must supply their plate number to confirm identity."""
     b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
-    if not b or b["customer_id"] != user["id"]:
-        raise HTTPException(403, "Not your booking")
+    if not b:
+        raise HTTPException(404, "Not found")
+    plate = ((data or {}).get("plate_number") or "").strip().upper()
+    if not plate or plate != (b.get("plate_number") or "").upper():
+        raise HTTPException(403, "Plate number does not match this booking")
     await db.bookings.update_one({"id": booking_id}, {"$set": {"approval_pending": False}})
     b["approval_pending"] = False
     recipients = await get_recipients_for_booking(b)
@@ -979,11 +919,12 @@ async def bill_preview(booking_id: str, extra_discount: float = 0.0,
     if not b:
         raise HTTPException(404, "Not found")
     pricing = await db.service_prices.find_one({"service_type": b.get("service_type")}, {"_id": 0})
-    cust = await db.users.find_one({"id": b["customer_id"]}, {"_id": 0}) if b.get("customer_id") else None
+    cust = {"name": b.get("customer_name"), "phone": b.get("customer_phone"),
+            "loyalty_tier": b.get("loyalty_tier", "BRONZE")}
     calc = _calculate_bill(b, pricing, cust, extra_discount=extra_discount)
     return {
         "booking_id": booking_id,
-        "customer": {"name": (cust or {}).get("name"), "phone": (cust or {}).get("phone")},
+        "customer": {"name": cust["name"], "phone": cust["phone"]},
         "car": {"make": b.get("car_make"), "model": b.get("car_model"), "plate": b.get("plate_number")},
         "service_type": b.get("service_type"),
         "items": b.get("items", []),
@@ -1004,11 +945,11 @@ async def bill(booking_id: str, data: Optional[dict] = None,
     if not b:
         raise HTTPException(404, "Not found")
     pricing = await db.service_prices.find_one({"service_type": b.get("service_type")}, {"_id": 0})
-    cust = await db.users.find_one({"id": b["customer_id"]}, {"_id": 0}) if b.get("customer_id") else None
+    cust = {"name": b.get("customer_name"), "phone": b.get("customer_phone"),
+            "loyalty_tier": b.get("loyalty_tier", "BRONZE")}
     calc = _calculate_bill(b, pricing, cust, extra_discount=extra_discount)
     bill_amount = calc["bill_amount"]
-    link = await RazorpayAdapter.create_payment_link(bill_amount, booking_id,
-                                                    (cust or {}).get("phone", ""))
+    link = await RazorpayAdapter.create_payment_link(bill_amount, booking_id, cust.get("phone") or "")
     upd = {"status": "BILLED",
            "bill_amount": bill_amount,
            "subtotal": calc["subtotal"],
@@ -1028,25 +969,21 @@ async def bill(booking_id: str, data: Optional[dict] = None,
 
 
 @api.post("/bookings/{booking_id}/pay")
-async def pay(booking_id: str, user=Depends(get_current_user)):
-    if user["role"] not in ("reception", "admin", "customer"):
-        raise HTTPException(403, "Forbidden")
-    if user["role"] == "customer":
-        b0 = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
-        if not b0 or b0.get("customer_id") != user["id"]:
-            raise HTTPException(403, "Not your booking")
+async def pay(booking_id: str, data: Optional[dict] = None):
+    """Public pay confirmation. Customer must include their plate to confirm (when calling
+    from the public /track page). Reception/admin can also call this."""
+    b0 = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+    if not b0:
+        raise HTTPException(404, "Not found")
+    plate_supplied = ((data or {}).get("plate_number") or "").strip().upper()
+    if plate_supplied and plate_supplied != (b0.get("plate_number") or "").upper():
+        raise HTTPException(403, "Plate number does not match this booking")
     upd = {"status": "PAID", "paid": True, "paid_at": now_iso()}
     await db.bookings.update_one({"id": booking_id}, {"$set": upd})
     b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
-    # update customer total_spent + loyalty tier
-    if b.get("customer_id"):
-        bookings = await db.bookings.find({"customer_id": b["customer_id"], "paid": True}, {"_id": 0, "bill_amount": 1}).to_list(1000)
-        total = sum(x.get("bill_amount", 0) for x in bookings)
-        tier = "GOLD" if total >= 25000 else ("SILVER" if total >= 10000 else "BRONZE")
-        await db.users.update_one({"id": b["customer_id"]}, {"$set": {"total_spent": total, "loyalty_tier": tier}})
-    # Send invoice (PDF link + summary) to customer via SMS + WhatsApp
-    cust = await db.users.find_one({"id": b.get("customer_id")}, {"_id": 0}) if b.get("customer_id") else None
-    if cust and cust.get("phone"):
+    # Send invoice link to customer via WhatsApp
+    cust_phone = b.get("customer_phone")
+    if cust_phone:
         public_url = os.environ.get("PUBLIC_URL") or os.environ.get("APP_URL") or ""
         invoice_url = f"{public_url}/api/invoices/{booking_id}.pdf"
         items_summary = ", ".join([f"{i['name']} x{i['qty']}" for i in (b.get("items") or [])][:3]) or "Service"
@@ -1058,11 +995,81 @@ async def pay(booking_id: str, user=Depends(get_current_user)):
             f"Invoice: {invoice_url}\n"
             f"Thanks for choosing MacJit. Drive safe!"
         )
-        await TwilioAdapter.send_sms(cust["phone"], msg)
-        await TwilioAdapter.send_whatsapp(cust["phone"], msg)
+        await TwilioAdapter.send_whatsapp(cust_phone, msg)
     recipients = await get_recipients_for_booking(b)
     await publish_event("PAID", b, recipients)
     return b
+
+
+# ---------- Public customer tracking (no auth) ----------
+@api.get("/track")
+async def track_by_plate(plate: str):
+    """Public endpoint: customer enters their plate number and sees the latest booking,
+    bill (if generated) and a pay action — no login required."""
+    plate_q = (plate or "").strip().upper()
+    if not plate_q:
+        raise HTTPException(400, "Plate number required")
+    # Case-insensitive match. Use regex anchored to avoid partial collisions.
+    import re
+    bookings = await db.bookings.find(
+        {"plate_number": {"$regex": f"^{re.escape(plate_q)}$", "$options": "i"}},
+        {"_id": 0}
+    ).sort("created_at", -1).to_list(20)
+    if not bookings:
+        raise HTTPException(404, "No booking found for this vehicle number")
+    active = next((b for b in bookings if b.get("status") != "PAID"), bookings[0])
+    public_url = os.environ.get("PUBLIC_URL") or os.environ.get("APP_URL") or ""
+    invoice_url = (f"{public_url}/api/invoices/{active['id']}.pdf"
+                   if active.get("status") in ("BILLED", "PAID") else None)
+    return {"active": active, "history": bookings, "invoice_url": invoice_url}
+
+
+@api.get("/track/booking/{booking_id}")
+async def track_booking_by_id(booking_id: str, plate: str = ""):
+    """Public: fetch a single booking by id, but only if the supplied plate matches.
+    Used by the customer-side checkout page so the customer can see their bill
+    without logging in."""
+    plate_q = (plate or "").strip().upper()
+    if not plate_q:
+        raise HTTPException(400, "Plate number required")
+    b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+    if not b:
+        raise HTTPException(404, "Not found")
+    if (b.get("plate_number") or "").upper() != plate_q:
+        raise HTTPException(403, "Plate number does not match this booking")
+    return b
+
+
+@api.post("/track/{booking_id}/send-bill")
+async def send_bill_whatsapp(booking_id: str, data: Optional[dict] = None):
+    """Public: re-send the current bill summary to the customer's WhatsApp.
+    Plate number must be supplied to confirm identity."""
+    b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+    if not b:
+        raise HTTPException(404, "Not found")
+    plate = ((data or {}).get("plate_number") or "").strip().upper()
+    if not plate or plate != (b.get("plate_number") or "").upper():
+        raise HTTPException(403, "Plate number does not match this booking")
+    if b.get("status") not in ("BILLED", "PAID"):
+        raise HTTPException(400, "Bill not generated yet — service still in progress.")
+    cust_phone = b.get("customer_phone")
+    if not cust_phone:
+        raise HTTPException(400, "No phone on file")
+    public_url = os.environ.get("PUBLIC_URL") or os.environ.get("APP_URL") or ""
+    invoice_url = f"{public_url}/api/invoices/{booking_id}.pdf"
+    pay_link = b.get("payment_link") or f"{public_url}/track?plate={b.get('plate_number','')}"
+    items_summary = ", ".join([f"{i['name']} x{i['qty']}" for i in (b.get("items") or [])][:3]) or "Service"
+    status_word = "PAID" if b.get("paid") else "DUE"
+    msg = (
+        f"MacJit Bill — {b.get('plate_number','')}\n"
+        f"Service: {b.get('service_type','')}\n"
+        f"Items: {items_summary}\n"
+        f"Amount {status_word}: \u20B9{b.get('bill_amount', 0)}\n"
+        f"Invoice: {invoice_url}\n"
+        f"Pay: {pay_link}"
+    )
+    await TwilioAdapter.send_whatsapp(cust_phone, msg)
+    return {"ok": True, "sent_to": cust_phone}
 
 
 # ---------- Invoice PDF (public) ----------
@@ -1083,7 +1090,7 @@ async def invoice_pdf(booking_id: str):
         raise HTTPException(404, "Not found")
     if b.get("status") not in ("BILLED", "PAID"):
         raise HTTPException(400, "Bill not generated yet")
-    cust = await db.users.find_one({"id": b.get("customer_id")}, {"_id": 0}) if b.get("customer_id") else None
+    cust = {"name": b.get("customer_name"), "phone": b.get("customer_phone")}
 
     biz_name = os.environ.get("BUSINESS_NAME", "MacJit")
     biz_loc = os.environ.get("BUSINESS_LOCATION", "Varthur, Bangalore - 560087")
@@ -1224,50 +1231,96 @@ async def upsert_pricing(data: PricingIn, user=Depends(require_roles("admin"))):
     return await db.service_prices.find_one({"service_type": data.service_type}, {"_id": 0})
 
 
-# ---------- Customer history & loyalty ----------
+# ---------- Customer history & loyalty (no accounts; aggregated from bookings) ----------
 @api.get("/customers")
 async def list_customers(user=Depends(require_roles("reception", "admin"))):
-    return await db.users.find({"role": "customer"}, {"_id": 0, "password_hash": 0}).to_list(500)
+    """Aggregate unique customers from bookings (since customers have no login)."""
+    pipeline = [
+        {"$group": {
+            "_id": "$customer_phone",
+            "name": {"$last": "$customer_name"},
+            "phone": {"$last": "$customer_phone"},
+            "total_spent": {"$sum": {"$cond": [{"$eq": ["$paid", True]}, "$bill_amount", 0]}},
+            "visits": {"$sum": 1},
+            "last_visit": {"$max": "$created_at"},
+        }},
+        {"$match": {"_id": {"$ne": None}}},
+        {"$sort": {"last_visit": -1}},
+    ]
+    items = []
+    async for c in db.bookings.aggregate(pipeline):
+        spent = c.get("total_spent", 0) or 0
+        tier = "GOLD" if spent >= 25000 else ("SILVER" if spent >= 10000 else "BRONZE")
+        items.append({
+            "id": f"walkin-{c['_id']}",
+            "name": c.get("name"), "phone": c.get("phone"),
+            "total_spent": spent, "loyalty_tier": tier, "visits": c.get("visits", 0),
+            "last_visit": c.get("last_visit"),
+        })
+    return items
 
 
 @api.get("/customers/{customer_id}/history")
-async def customer_history(customer_id: str, user=Depends(get_current_user)):
-    if user["role"] == "customer" and user["id"] != customer_id:
-        raise HTTPException(403, "Forbidden")
-    cust = await db.users.find_one({"id": customer_id}, {"_id": 0, "password_hash": 0})
-    if not cust:
+async def customer_history(customer_id: str, user=Depends(require_roles("reception", "admin"))):
+    """customer_id is `walkin-{phone}` (matches the IDs returned by /customers)."""
+    phone = customer_id.replace("walkin-", "", 1) if customer_id.startswith("walkin-") else customer_id
+    bookings = await db.bookings.find({"customer_phone": phone}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    if not bookings:
         raise HTTPException(404, "Not found")
-    bookings = await db.bookings.find({"customer_id": customer_id}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    spent = sum(b.get("bill_amount", 0) for b in bookings if b.get("paid"))
+    tier = "GOLD" if spent >= 25000 else ("SILVER" if spent >= 10000 else "BRONZE")
+    cust = {"id": customer_id, "name": bookings[0].get("customer_name"), "phone": phone,
+            "total_spent": spent, "loyalty_tier": tier}
     return {"customer": cust, "bookings": bookings,
-            "total_spent": cust.get("total_spent", 0),
-            "loyalty_tier": cust.get("loyalty_tier", "BRONZE"),
-            "discount_pct": LOYALTY_DISCOUNT.get(cust.get("loyalty_tier", "BRONZE"), 0)}
+            "total_spent": spent, "loyalty_tier": tier,
+            "discount_pct": LOYALTY_DISCOUNT.get(tier, 0)}
 
 
 # ---------- Staff management ----------
+ALLOWED_STAFF_ROLES = ("mechanic", "reception", "tester", "shopkeeper", "admin")
+
+
 @api.get("/admin/staff")
 async def list_staff(user=Depends(require_roles("admin"))):
-    return await db.users.find({"role": {"$in": ["mechanic", "reception", "tester", "admin"]}}, {"_id": 0, "password_hash": 0}).to_list(500)
+    """Returns staff with their initial password while it has not yet been changed,
+    so the admin can pass it on to the employee. Password disappears once the
+    employee logs in and resets it."""
+    return await db.users.find(
+        {"role": {"$in": list(ALLOWED_STAFF_ROLES)}},
+        {"_id": 0, "password_hash": 0}
+    ).to_list(500)
 
 
 @api.post("/admin/staff")
 async def create_staff(data: StaffCreate, user=Depends(require_roles("admin"))):
-    if data.role not in ("mechanic", "reception", "tester", "admin"):
+    if data.role not in ALLOWED_STAFF_ROLES:
         raise HTTPException(400, "Invalid role")
-    if await db.users.find_one({"phone": data.phone}):
+    phone = _normalize_phone(data.phone)
+    if not phone or len(phone) < 10:
+        raise HTTPException(400, "Valid phone required")
+    if await db.users.find_one({"phone": phone}):
         raise HTTPException(400, "Phone already registered")
-    tmp = uuid.uuid4().hex[:8]
-    doc = {"id": str(uuid.uuid4()), "username": data.phone, "name": data.name,
-           "phone": data.phone, "role": data.role,
-           "password_hash": await hash_password(tmp),
-           "active": True, "created_at": now_iso()}
+    initial_pwd = (data.password or "").strip() or uuid.uuid4().hex[:8]
+    if len(initial_pwd) < 6:
+        raise HTTPException(400, "Password must be at least 6 characters")
+    doc = {"id": str(uuid.uuid4()), "username": phone, "name": data.name,
+           "phone": phone, "role": data.role,
+           "password_hash": await hash_password(initial_pwd),
+           "initial_password": initial_pwd,
+           "must_reset_password": True,
+           "active": True, "created_at": now_iso(), "created_by": user["id"]}
     await db.users.insert_one(dict(doc))
-    reset_token = uuid.uuid4().hex
-    await db.password_resets.insert_one({"token": reset_token, "user_id": doc["id"], "ts": now_iso()})
-    link = f"{os.environ.get('PUBLIC_URL','')}/reset?token={reset_token}"
-    await TwilioAdapter.send_sms(data.phone, f"MacJit: Welcome {data.name}! Set your password: {link}  (Temp: {tmp})")
+    # Best-effort SMS so the employee gets the initial password directly.
+    try:
+        await TwilioAdapter.send_sms(
+            phone,
+            f"MacJit: Welcome {data.name}! Login at the staff page with phone {phone} "
+            f"and temporary password: {initial_pwd}. You will be asked to set a new password."
+        )
+    except Exception as e:
+        logger.warning(f"Staff invite SMS failed: {e}")
     doc.pop("password_hash", None)
-    return {**doc, "temp_password": tmp, "reset_link": link}
+    return doc
 
 
 @api.patch("/admin/staff/{user_id}")
@@ -1275,6 +1328,38 @@ async def update_staff(user_id: str, data: dict, user=Depends(require_roles("adm
     data.pop("_id", None); data.pop("id", None); data.pop("password_hash", None)
     await db.users.update_one({"id": user_id}, {"$set": data})
     return await db.users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0})
+
+
+@api.delete("/admin/staff/{user_id}")
+async def delete_staff(user_id: str, user=Depends(require_roles("admin"))):
+    target = await db.users.find_one({"id": user_id}, {"_id": 0})
+    if not target:
+        raise HTTPException(404, "Staff not found")
+    if target.get("role") not in ALLOWED_STAFF_ROLES:
+        raise HTTPException(400, "Not a staff account")
+    if target["id"] == user["id"]:
+        raise HTTPException(400, "You cannot remove your own account")
+    if target.get("role") == "admin":
+        admin_count = await db.users.count_documents({"role": "admin"})
+        if admin_count <= 1:
+            raise HTTPException(400, "Cannot remove the only admin")
+    await db.users.delete_one({"id": user_id})
+    return {"ok": True}
+
+
+@api.post("/admin/staff/{user_id}/reset-password")
+async def reset_staff_password(user_id: str, user=Depends(require_roles("admin"))):
+    """Generate a fresh temporary password for a staff member and force a reset on next login."""
+    target = await db.users.find_one({"id": user_id}, {"_id": 0})
+    if not target or target.get("role") not in ALLOWED_STAFF_ROLES:
+        raise HTTPException(404, "Staff not found")
+    new_pwd = uuid.uuid4().hex[:8]
+    h = await hash_password(new_pwd)
+    await db.users.update_one(
+        {"id": user_id},
+        {"$set": {"password_hash": h, "initial_password": new_pwd, "must_reset_password": True}}
+    )
+    return {"ok": True, "initial_password": new_pwd}
 
 
 # ---------- Bulk inventory ----------
@@ -1879,6 +1964,15 @@ async def startup():
     deleted = await db.users.delete_many({"username": {"$in": OLD_DEMO_USERNAMES}})
     if deleted.deleted_count:
         logger.info(f"Cleaned up {deleted.deleted_count} legacy demo users")
+    # Customers no longer have accounts — purge any leftovers from older builds.
+    cust_purged = await db.users.delete_many({"role": "customer"})
+    if cust_purged.deleted_count:
+        logger.info(f"Purged {cust_purged.deleted_count} legacy customer accounts (customers no longer log in)")
+    # Drop OTP collection if present (feature removed)
+    try:
+        await db.otps.drop()
+    except Exception:
+        pass
     # One-time cleanup: remove old 2-wheeler demo inventory
     OLD_INV_SKUS = ["OIL-CST-1L", "BRK-PAD-01", "FLT-AIR-01", "SPK-NGK-01",
                     "CHN-LUB-01", "TYR-90-17", "COL-500"]
@@ -1931,6 +2025,15 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 
 FRONTEND_BUILD = ROOT_DIR.parent / "frontend" / "build"
+NO_CACHE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
+
+def _serve_index():
+    return FileResponse(str(FRONTEND_BUILD / "index.html"), headers=NO_CACHE_HEADERS)
+
 if FRONTEND_BUILD.exists():
     static_dir = FRONTEND_BUILD / "static"
     if static_dir.exists():
@@ -1938,7 +2041,7 @@ if FRONTEND_BUILD.exists():
 
     @app.get("/")
     async def _spa_root():
-        return FileResponse(str(FRONTEND_BUILD / "index.html"))
+        return _serve_index()
 
     @app.get("/{full_path:path}")
     async def _spa_fallback(full_path: str):
@@ -1949,8 +2052,12 @@ if FRONTEND_BUILD.exists():
             return JSONResponse({"detail": "Not Found"}, status_code=404)
         candidate = FRONTEND_BUILD / full_path
         if candidate.exists() and candidate.is_file():
+            # Disable caching for the service worker and the HTML shell so
+            # browsers always pick up the latest build.
+            if full_path in ("sw.js", "index.html", "manifest.json"):
+                return FileResponse(str(candidate), headers=NO_CACHE_HEADERS)
             return FileResponse(str(candidate))
-        return FileResponse(str(FRONTEND_BUILD / "index.html"))
+        return _serve_index()
 else:
     @app.get("/")
     async def _no_build():
