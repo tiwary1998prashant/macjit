@@ -15,7 +15,7 @@ from typing import List, Optional, Dict, Any
 
 import jwt
 import bcrypt
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, WebSocket, WebSocketDisconnect, UploadFile, File
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, WebSocket, WebSocketDisconnect, UploadFile, File, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -965,6 +965,169 @@ async def bill(booking_id: str, data: Optional[dict] = None,
     recipients = await get_recipients_for_booking(b)
     await publish_event("BILLED", b, recipients,
                         extra={"bill_amount": bill_amount, "payment_link": link})
+    return b
+
+
+@api.post("/razorpay/webhook")
+async def razorpay_webhook(request: Request):
+    """Razorpay webhook receiver. Verifies the X-Razorpay-Signature header against
+    RAZORPAY_WEBHOOK_SECRET and, on a payment.captured event, marks the matching
+    booking as paid. This catches payments made via the SMS/WhatsApp pay link
+    (i.e. payments that don't go through the in-app Checkout modal)."""
+    import hmac, hashlib
+    secret = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "")
+    if not secret:
+        raise HTTPException(503, "Webhook secret not configured")
+    raw = await request.body()
+    signature = request.headers.get("x-razorpay-signature", "")
+    expected = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        logger.warning("[RAZORPAY-WEBHOOK] bad signature")
+        raise HTTPException(400, "Invalid signature")
+    try:
+        payload = json.loads(raw.decode() or "{}")
+    except Exception:
+        raise HTTPException(400, "Bad JSON")
+    event = payload.get("event", "")
+    if event not in ("payment.captured", "payment_link.paid", "order.paid"):
+        return {"ok": True, "ignored": event}
+    payment = (((payload.get("payload") or {}).get("payment") or {}).get("entity") or {})
+    notes = payment.get("notes") or {}
+    booking_id = notes.get("booking_id")
+    # payment_link events carry booking_id in the payment_link entity notes
+    if not booking_id:
+        plink = (((payload.get("payload") or {}).get("payment_link") or {}).get("entity") or {})
+        booking_id = (plink.get("notes") or {}).get("booking_id")
+    if not booking_id:
+        logger.warning(f"[RAZORPAY-WEBHOOK] no booking_id in notes for event={event}")
+        return {"ok": True, "no_booking": True}
+    b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+    if not b:
+        return {"ok": True, "not_found": True}
+    if b.get("paid"):
+        return {"ok": True, "already_paid": True}
+    upd = {
+        "status": "PAID", "paid": True, "paid_at": now_iso(),
+        "razorpay_payment_id": payment.get("id"),
+        "razorpay_order_id": payment.get("order_id"),
+        "payment_method": "razorpay",
+    }
+    await db.bookings.update_one({"id": booking_id}, {"$set": upd})
+    b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+    cust_phone = b.get("customer_phone")
+    if cust_phone:
+        public_url = os.environ.get("PUBLIC_URL") or os.environ.get("APP_URL") or ""
+        invoice_url = f"{public_url}/api/invoices/{booking_id}.pdf"
+        msg = (
+            f"MacJit Invoice — {b.get('plate_number','')}\n"
+            f"Total Paid: \u20B9{b.get('bill_amount',0)}\n"
+            f"Invoice: {invoice_url}\n"
+            f"Thanks for choosing MacJit. Drive safe!"
+        )
+        await TwilioAdapter.send_whatsapp(cust_phone, msg)
+    recipients = await get_recipients_for_booking(b)
+    await publish_event("PAID", b, recipients)
+    return {"ok": True, "booking_id": booking_id}
+
+
+@api.post("/bookings/{booking_id}/razorpay/order")
+async def create_razorpay_order(booking_id: str, data: Optional[dict] = None):
+    """Create a Razorpay Order for a booking. Customer must supply plate to confirm.
+    Returns the order_id + key_id needed by the Razorpay Checkout JS modal."""
+    if not (os.environ.get("RAZORPAY_KEY_ID") and os.environ.get("RAZORPAY_KEY_SECRET")):
+        raise HTTPException(503, "Online payment is not configured")
+    b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+    if not b:
+        raise HTTPException(404, "Not found")
+    plate = ((data or {}).get("plate_number") or "").strip().upper()
+    if not plate or plate != (b.get("plate_number") or "").upper():
+        raise HTTPException(403, "Plate number does not match this booking")
+    if b.get("paid"):
+        raise HTTPException(400, "Booking is already paid")
+    amount_paise = int(round(float(b.get("bill_amount") or 0) * 100))
+    if amount_paise <= 0:
+        raise HTTPException(400, "Bill not generated yet")
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=15) as cli:
+            r = await cli.post(
+                "https://api.razorpay.com/v1/orders",
+                json={
+                    "amount": amount_paise,
+                    "currency": "INR",
+                    "receipt": booking_id[:40],
+                    "notes": {"booking_id": booking_id, "plate": b.get("plate_number", "")},
+                },
+                auth=(os.environ["RAZORPAY_KEY_ID"], os.environ["RAZORPAY_KEY_SECRET"]),
+            )
+            if r.status_code >= 400:
+                logger.error(f"[RAZORPAY-ORDER-ERR] {r.status_code} {r.text}")
+                raise HTTPException(502, "Razorpay order creation failed")
+            order = r.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[RAZORPAY-ORDER-EXC] {e}")
+        raise HTTPException(502, "Razorpay unavailable")
+    return {
+        "order_id": order["id"],
+        "amount": order["amount"],
+        "currency": order["currency"],
+        "key_id": os.environ["RAZORPAY_KEY_ID"],
+        "name": "MacJit Garage",
+        "description": f"Service for {b.get('plate_number', '')}",
+        "prefill": {
+            "name": b.get("customer_name") or "",
+            "contact": b.get("customer_phone") or "",
+            "email": b.get("customer_email") or "",
+        },
+    }
+
+
+@api.post("/bookings/{booking_id}/razorpay/verify")
+async def verify_razorpay_payment(booking_id: str, data: dict):
+    """Verify a Razorpay payment signature (HMAC-SHA256 of order_id|payment_id with
+    key_secret). Only on success do we mark the booking as paid."""
+    import hmac, hashlib
+    payment_id = (data.get("razorpay_payment_id") or "").strip()
+    order_id = (data.get("razorpay_order_id") or "").strip()
+    signature = (data.get("razorpay_signature") or "").strip()
+    plate = (data.get("plate_number") or "").strip().upper()
+    if not (payment_id and order_id and signature):
+        raise HTTPException(400, "Missing Razorpay payment fields")
+    b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+    if not b:
+        raise HTTPException(404, "Not found")
+    if not plate or plate != (b.get("plate_number") or "").upper():
+        raise HTTPException(403, "Plate number does not match this booking")
+    secret = (os.environ.get("RAZORPAY_KEY_SECRET") or "").encode()
+    expected = hmac.new(secret, f"{order_id}|{payment_id}".encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        logger.warning(f"[RAZORPAY-VERIFY-FAIL] booking={booking_id}")
+        raise HTTPException(400, "Invalid payment signature")
+    upd = {
+        "status": "PAID", "paid": True, "paid_at": now_iso(),
+        "razorpay_payment_id": payment_id, "razorpay_order_id": order_id,
+        "payment_method": "razorpay",
+    }
+    await db.bookings.update_one({"id": booking_id}, {"$set": upd})
+    b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+    cust_phone = b.get("customer_phone")
+    if cust_phone:
+        public_url = os.environ.get("PUBLIC_URL") or os.environ.get("APP_URL") or ""
+        invoice_url = f"{public_url}/api/invoices/{booking_id}.pdf"
+        items_summary = ", ".join([f"{i['name']} x{i['qty']}" for i in (b.get("items") or [])][:3]) or "Service"
+        msg = (
+            f"MacJit Invoice — {b.get('plate_number','')}\n"
+            f"Service: {b.get('service_type','')}\n"
+            f"Items: {items_summary}\n"
+            f"Total Paid: \u20B9{b.get('bill_amount',0)}\n"
+            f"Invoice: {invoice_url}\n"
+            f"Thanks for choosing MacJit. Drive safe!"
+        )
+        await TwilioAdapter.send_whatsapp(cust_phone, msg)
+    recipients = await get_recipients_for_booking(b)
+    await publish_event("PAID", b, recipients)
     return b
 
 
