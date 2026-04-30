@@ -203,6 +203,17 @@ class ShopSaleIn(BaseModel):
     payment_method: str = "cash"  # cash | razorpay
 
 
+class RefundIn(BaseModel):
+    sale_id: str
+    reason: str
+    items: Optional[List[ShopSaleLine]] = None  # if None → full refund of all sale items
+
+
+class RefundDecision(BaseModel):
+    decision: str  # approved | rejected
+    note: str = ""
+
+
 class UserOut(BaseModel):
     model_config = ConfigDict(extra="ignore")
     id: str
@@ -1261,6 +1272,49 @@ async def invoice_pdf(booking_id: str):
     biz_email = os.environ.get("BUSINESS_EMAIL", "hello@macjit.com")
     biz_domain = os.environ.get("BUSINESS_DOMAIN", "macjit.com")
 
+    def _watermark(canvas, _doc):
+        """Center MacJit logo + text watermark, faded, on every page."""
+        canvas.saveState()
+        page_w, page_h = A4
+        cx, cy = page_w / 2, page_h / 2
+        # Outer ring (thin orange)
+        canvas.setStrokeColor(colors.HexColor("#F26A21"))
+        canvas.setFillColor(colors.HexColor("#F26A21"))
+        canvas.setLineWidth(2)
+        # Apply transparency for the whole watermark
+        try:
+            canvas.setFillAlpha(0.07)
+            canvas.setStrokeAlpha(0.18)
+        except Exception:
+            pass
+        canvas.circle(cx, cy, 70 * mm, stroke=1, fill=0)
+        # Inner solid disk (faded)
+        canvas.setFillColor(colors.HexColor("#1E2A44"))
+        try:
+            canvas.setFillAlpha(0.05)
+        except Exception:
+            pass
+        canvas.circle(cx, cy, 60 * mm, stroke=0, fill=1)
+        # Big "M" mark in center
+        canvas.setFillColor(colors.HexColor("#F26A21"))
+        try:
+            canvas.setFillAlpha(0.12)
+        except Exception:
+            pass
+        canvas.setFont("Helvetica-Bold", 200)
+        canvas.drawCentredString(cx, cy - 65, "M")
+        # Brand strip beneath
+        canvas.setFillColor(colors.HexColor("#1E2A44"))
+        try:
+            canvas.setFillAlpha(0.15)
+        except Exception:
+            pass
+        canvas.setFont("Helvetica-Bold", 28)
+        canvas.drawCentredString(cx, cy - 95, "MACJIT")
+        canvas.setFont("Helvetica", 10)
+        canvas.drawCentredString(cx, cy - 110, "MECHANIC · JUST · IN · TIME")
+        canvas.restoreState()
+
     buf = BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, rightMargin=20 * mm,
                             leftMargin=20 * mm, topMargin=18 * mm, bottomMargin=18 * mm)
@@ -1365,7 +1419,7 @@ async def invoice_pdf(booking_id: str):
         small))
     story.append(Paragraph("This is a computer-generated invoice; no signature required.", small))
 
-    doc.build(story)
+    doc.build(story, onFirstPage=_watermark, onLaterPages=_watermark)
     pdf = buf.getvalue()
     buf.close()
     return Response(content=pdf, media_type="application/pdf",
@@ -2009,6 +2063,205 @@ async def shop_stats(user=Depends(require_roles("shopkeeper", "admin", "receptio
         "last_7_days": last_7,
         "total_sales": len(sales),
         "fast_movers": fast_movers,
+    }
+
+
+# ---------- REFUNDS (shop) ----------
+@api.post("/shop/refunds")
+async def raise_refund(data: RefundIn, user=Depends(require_roles("shopkeeper", "admin"))):
+    """Shopkeeper raises a refund request for a paid shop sale.
+    Admin must approve before stock is restored and sale is flagged refunded."""
+    sale = await db.shop_sales.find_one({"id": data.sale_id}, {"_id": 0})
+    if not sale:
+        raise HTTPException(404, "Sale not found")
+    if not sale.get("paid"):
+        raise HTTPException(400, "Only paid sales can be refunded")
+    if sale.get("refund_status") in ("PENDING", "APPROVED"):
+        raise HTTPException(400, f"Refund already {sale['refund_status']}")
+
+    # Build refund line items (full or partial)
+    sale_items_by_id = {it["inventory_id"]: it for it in sale.get("items", [])}
+    refund_items = []
+    if data.items:
+        for line in data.items:
+            base = sale_items_by_id.get(line.inventory_id)
+            if not base:
+                raise HTTPException(400, f"Item {line.inventory_id} not in sale")
+            if line.qty <= 0 or line.qty > base["qty"]:
+                raise HTTPException(400, f"Invalid qty for {base['name']}")
+            refund_items.append({**base, "qty": line.qty,
+                                 "subtotal": base["price"] * line.qty})
+    else:
+        refund_items = [dict(it) for it in sale.get("items", [])]
+    refund_total = sum(it["subtotal"] for it in refund_items)
+
+    refund = {
+        "id": str(uuid.uuid4()),
+        "sale_id": sale["id"],
+        "customer_name": sale.get("customer_name"),
+        "customer_phone": sale.get("customer_phone"),
+        "items": refund_items,
+        "amount": refund_total,
+        "reason": data.reason,
+        "status": "PENDING",
+        "raised_by_id": user["id"],
+        "raised_by_name": user["name"],
+        "raised_at": now_iso(),
+        "decided_by_name": None,
+        "decided_at": None,
+        "decision_note": "",
+    }
+    await db.refunds.insert_one(dict(refund))
+    refund.pop("_id", None)
+    await db.shop_sales.update_one({"id": sale["id"]}, {"$set": {"refund_status": "PENDING"}})
+
+    admin_ids = [u["id"] async for u in db.users.find({"role": "admin"}, {"_id": 0, "id": 1})]
+    await bus.fanout(admin_ids, {"type": "REFUND_RAISED", "data": refund, "ts": now_iso()})
+    await db.notifications.insert_one({
+        "id": str(uuid.uuid4()),
+        "user_id": admin_ids[0] if admin_ids else "",
+        "event_type": "REFUND_RAISED",
+        "title": "Refund request",
+        "body": f"₹{refund_total:.0f} · {sale.get('customer_name','Walk-in')} · {data.reason[:40]}",
+        "read": False, "ts": now_iso(),
+    })
+    return refund
+
+
+@api.get("/shop/refunds")
+async def my_refunds(user=Depends(require_roles("shopkeeper", "admin", "reception"))):
+    q = {} if user.get("role") == "admin" else {"raised_by_id": user["id"]}
+    return await db.refunds.find(q, {"_id": 0}).sort("raised_at", -1).to_list(200)
+
+
+@api.get("/admin/refunds")
+async def admin_list_refunds(status: Optional[str] = None,
+                             user=Depends(require_roles("admin"))):
+    q = {}
+    if status:
+        q["status"] = status.upper()
+    return await db.refunds.find(q, {"_id": 0}).sort("raised_at", -1).to_list(500)
+
+
+@api.post("/admin/refunds/{refund_id}/decision")
+async def decide_refund(refund_id: str, data: RefundDecision,
+                        user=Depends(require_roles("admin"))):
+    decision = (data.decision or "").lower()
+    if decision not in ("approved", "rejected"):
+        raise HTTPException(400, "decision must be 'approved' or 'rejected'")
+    refund = await db.refunds.find_one({"id": refund_id}, {"_id": 0})
+    if not refund:
+        raise HTTPException(404, "Refund not found")
+    if refund["status"] != "PENDING":
+        raise HTTPException(400, f"Already {refund['status']}")
+
+    new_status = "APPROVED" if decision == "approved" else "REJECTED"
+    await db.refunds.update_one({"id": refund_id}, {"$set": {
+        "status": new_status,
+        "decided_by_name": user["name"],
+        "decided_at": now_iso(),
+        "decision_note": data.note or "",
+    }})
+
+    if new_status == "APPROVED":
+        # Restore stock & mark sale refunded
+        for it in refund["items"]:
+            await db.inventory.update_one({"id": it["inventory_id"]},
+                                          {"$inc": {"stock": it["qty"]}})
+        await db.shop_sales.update_one({"id": refund["sale_id"]}, {"$set": {
+            "refund_status": "APPROVED",
+            "refunded_amount": refund["amount"],
+            "refunded_at": now_iso(),
+        }})
+    else:
+        await db.shop_sales.update_one({"id": refund["sale_id"]},
+                                       {"$set": {"refund_status": "REJECTED"}})
+
+    # Notify shopkeeper
+    await db.notifications.insert_one({
+        "id": str(uuid.uuid4()),
+        "user_id": refund["raised_by_id"],
+        "event_type": f"REFUND_{new_status}",
+        "title": f"Refund {new_status.lower()}",
+        "body": f"₹{refund['amount']:.0f} · {data.note or 'no note'}",
+        "read": False, "ts": now_iso(),
+    })
+    await bus.fanout([refund["raised_by_id"]],
+                     {"type": f"REFUND_{new_status}", "data": refund, "ts": now_iso()})
+    return await db.refunds.find_one({"id": refund_id}, {"_id": 0})
+
+
+# ---------- ADMIN TRANSACTIONS (Paytm-style unified history) ----------
+@api.get("/admin/transactions")
+async def admin_transactions(type: str = "all", q: str = "", limit: int = 200,
+                             user=Depends(require_roles("admin"))):
+    """Unified payment history across services (paid bookings) and shop (paid counter sales).
+    Filter `type`: all | service | shop. `q` matches customer name/phone/plate/sku."""
+    type = (type or "all").lower()
+    items: list = []
+
+    if type in ("all", "service"):
+        bookings = await db.bookings.find({"paid": True}, {"_id": 0}).sort("paid_at", -1).to_list(500)
+        for b in bookings:
+            items.append({
+                "id": b["id"],
+                "kind": "service",
+                "ref": b["id"][:8].upper(),
+                "customer_name": b.get("customer_name") or "—",
+                "customer_phone": b.get("customer_phone") or "",
+                "title": f"{b.get('service_type','service')} · {b.get('plate_number','')}",
+                "subtitle": f"{b.get('car_make','')} {b.get('car_model','')}".strip() or "—",
+                "amount": b.get("bill_amount", 0),
+                "method": b.get("payment_method") or ("razorpay" if b.get("razorpay_payment_id") else "cash"),
+                "ts": b.get("paid_at") or b.get("billed_at") or b.get("created_at"),
+                "items": b.get("items") or [],
+                "extra": {"mechanic": b.get("mechanic_name") or "—",
+                          "bay": b.get("bay_name") or "—",
+                          "razorpay_payment_id": b.get("razorpay_payment_id")},
+                "invoice_url": f"/api/invoices/{b['id']}.pdf",
+            })
+
+    if type in ("all", "shop"):
+        sales = await db.shop_sales.find({"paid": True}, {"_id": 0}).sort("paid_at", -1).to_list(500)
+        for s in sales:
+            items.append({
+                "id": s["id"],
+                "kind": "shop",
+                "ref": s["id"][:8].upper(),
+                "customer_name": s.get("customer_name") or "Walk-in",
+                "customer_phone": s.get("customer_phone") or "",
+                "title": f"{len(s.get('items', []))} item(s) · {s.get('shopkeeper_name','counter')}",
+                "subtitle": ", ".join((it.get("name") or "")[:24] for it in (s.get("items") or [])[:2]) or "—",
+                "amount": s.get("total", 0),
+                "method": s.get("payment_method") or "cash",
+                "ts": s.get("paid_at") or s.get("created_at"),
+                "items": s.get("items") or [],
+                "extra": {"refund_status": s.get("refund_status"),
+                          "refunded_amount": s.get("refunded_amount")},
+                "invoice_url": None,
+            })
+
+    if q:
+        ql = q.lower()
+        def match(t):
+            blob = " ".join([
+                str(t.get("customer_name") or ""),
+                str(t.get("customer_phone") or ""),
+                str(t.get("title") or ""),
+                str(t.get("ref") or ""),
+                " ".join((it.get("name", "") + " " + it.get("sku", "")) for it in t.get("items", [])),
+            ]).lower()
+            return ql in blob
+        items = [t for t in items if match(t)]
+
+    items.sort(key=lambda x: x.get("ts") or "", reverse=True)
+    items = items[:limit]
+    return {
+        "transactions": items,
+        "total_amount": sum(t["amount"] for t in items),
+        "count": len(items),
+        "service_count": sum(1 for t in items if t["kind"] == "service"),
+        "shop_count": sum(1 for t in items if t["kind"] == "shop"),
     }
 
 
