@@ -1779,7 +1779,13 @@ async def admin_stats(user=Depends(require_roles("admin", "reception"))):
     today = datetime.now(timezone.utc).date().isoformat()
     all_bookings = await db.bookings.find({}, {"_id": 0}).to_list(2000)
     today_done = [b for b in all_bookings if (b.get("paid_at") or "").startswith(today)]
-    revenue_today = sum(b.get("bill_amount", 0) for b in today_done)
+
+    # Approved refunds (shop) — subtracted from revenue net
+    approved_refunds = await db.refunds.find({"status": "APPROVED"}, {"_id": 0}).to_list(2000)
+    refund_today_total = sum(r.get("amount", 0) for r in approved_refunds
+                             if (r.get("decided_at") or "").startswith(today))
+
+    revenue_today = sum(b.get("bill_amount", 0) for b in today_done) - refund_today_total
     by_status = {}
     for b in all_bookings:
         by_status[b["status"]] = by_status.get(b["status"], 0) + 1
@@ -1787,12 +1793,15 @@ async def admin_stats(user=Depends(require_roles("admin", "reception"))):
     for i in range(6, -1, -1):
         d = (datetime.now(timezone.utc).date() - timedelta(days=i)).isoformat()
         day_bs = [b for b in all_bookings if (b.get("paid_at") or "").startswith(d)]
+        day_refunds = sum(r.get("amount", 0) for r in approved_refunds
+                          if (r.get("decided_at") or "").startswith(d))
         last_7.append({"date": d, "serviced": len(day_bs),
-                       "revenue": sum(b.get("bill_amount", 0) for b in day_bs)})
+                       "revenue": sum(b.get("bill_amount", 0) for b in day_bs) - day_refunds})
     inv = await db.inventory.find({}, {"_id": 0}).to_list(1000)
     return {
         "today_serviced": len(today_done),
         "today_revenue": revenue_today,
+        "today_refunds": refund_today_total,
         "active_bays": sum(1 for b in all_bookings if b["status"] == "IN_SERVICE"),
         "total_bookings": len(all_bookings),
         "by_status": by_status,
@@ -2038,11 +2047,20 @@ async def shop_stats(user=Depends(require_roles("shopkeeper", "admin", "receptio
     sales = await db.shop_sales.find({}, {"_id": 0}).to_list(2000)
     today_sales = [s for s in sales if (s.get("created_at") or "").startswith(today)]
     today_paid = [s for s in today_sales if s.get("paid")]
+
+    # Approved shop refunds (subtract from revenue net)
+    approved_refunds = await db.refunds.find({"status": "APPROVED"}, {"_id": 0}).to_list(2000)
+    refund_today_total = sum(r.get("amount", 0) for r in approved_refunds
+                             if (r.get("decided_at") or "").startswith(today))
+
     last_7 = []
     for i in range(6, -1, -1):
         d = (datetime.now(timezone.utc).date() - timedelta(days=i)).isoformat()
         day = [s for s in sales if (s.get("created_at") or "").startswith(d) and s.get("paid")]
-        last_7.append({"date": d, "sales": len(day), "revenue": sum(s.get("total", 0) for s in day)})
+        day_refunds = sum(r.get("amount", 0) for r in approved_refunds
+                          if (r.get("decided_at") or "").startswith(d))
+        last_7.append({"date": d, "sales": len(day),
+                       "revenue": sum(s.get("total", 0) for s in day) - day_refunds})
     # Top fast-movers (last 7 days, by units sold)
     cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
     movers = {}
@@ -2058,7 +2076,8 @@ async def shop_stats(user=Depends(require_roles("shopkeeper", "admin", "receptio
     fast_movers = sorted(movers.values(), key=lambda x: x["units"], reverse=True)[:5]
     return {
         "today_count": len(today_sales),
-        "today_revenue": sum(s.get("total", 0) for s in today_paid),
+        "today_revenue": sum(s.get("total", 0) for s in today_paid) - refund_today_total,
+        "today_refunds": refund_today_total,
         "pending_count": sum(1 for s in sales if not s.get("paid")),
         "last_7_days": last_7,
         "total_sales": len(sales),
@@ -2241,6 +2260,28 @@ async def admin_transactions(type: str = "all", q: str = "", limit: int = 200,
                 "invoice_url": None,
             })
 
+        # Add an explicit refund row (negative amount) for each approved refund
+        approved_refunds = await db.refunds.find({"status": "APPROVED"}, {"_id": 0}).to_list(500)
+        for r in approved_refunds:
+            items.append({
+                "id": r["id"],
+                "kind": "refund",
+                "ref": "RF-" + r["id"][:6].upper(),
+                "customer_name": r.get("customer_name") or "Walk-in",
+                "customer_phone": r.get("customer_phone") or "",
+                "title": f"Refund · sale #{r.get('sale_id','')[:8]}",
+                "subtitle": (r.get("reason") or "")[:60] or "—",
+                "amount": -float(r.get("amount", 0)),
+                "method": "refund",
+                "ts": r.get("decided_at") or r.get("raised_at"),
+                "items": r.get("items") or [],
+                "extra": {"raised_by": r.get("raised_by_name"),
+                          "decided_by": r.get("decided_by_name"),
+                          "note": r.get("decision_note"),
+                          "sale_id": r.get("sale_id")},
+                "invoice_url": None,
+            })
+
     if q:
         ql = q.lower()
         def match(t):
@@ -2256,12 +2297,17 @@ async def admin_transactions(type: str = "all", q: str = "", limit: int = 200,
 
     items.sort(key=lambda x: x.get("ts") or "", reverse=True)
     items = items[:limit]
+    gross_in = sum(t["amount"] for t in items if t["amount"] > 0)
+    refund_out = -sum(t["amount"] for t in items if t["amount"] < 0)
     return {
         "transactions": items,
-        "total_amount": sum(t["amount"] for t in items),
+        "total_amount": gross_in - refund_out,   # NET (after refunds)
+        "gross_amount": gross_in,                # before refunds
+        "refund_amount": refund_out,             # total refunded out
         "count": len(items),
         "service_count": sum(1 for t in items if t["kind"] == "service"),
         "shop_count": sum(1 for t in items if t["kind"] == "shop"),
+        "refund_count": sum(1 for t in items if t["kind"] == "refund"),
     }
 
 
