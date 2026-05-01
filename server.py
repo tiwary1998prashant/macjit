@@ -572,12 +572,14 @@ async def publish_event(event_type: str, booking: dict, recipients: List[str], e
     # Build template context once (used for both notif body and Twilio msg)
     _mech = booking.get("mechanic_name") or "our team"
     _tester = booking.get("tester_name") or ""
+    _qa_reasons = booking.get("qa_fail_reasons") or []
     _ctx = {
         "plate": booking.get("plate_number", ""),
         "id": (booking.get("id") or "")[:6],
         "mechanic": _mech,
         "tester": _tester,
         "tester_part": f" by {_tester}" if _tester else "",
+        "qa_fail_reasons": ", ".join(_qa_reasons) if _qa_reasons else "—",
     }
 
     # Notifications stored per recipient
@@ -626,6 +628,7 @@ EVENT_TITLES = {
     "APPROVAL_GRANTED": "Customer Approved",
     "SERVICE_FINISHED": "Service Finished",
     "QA_DONE": "QA Done - Ready for Pickup",
+    "QA_FAIL": "QA Failed - Returned to Mechanic",
     "BILLED": "Bill Generated",
     "PAID": "Payment Received",
 }
@@ -637,6 +640,7 @@ EVENT_BODIES = {
     "APPROVAL_GRANTED": "MacJit: Approval received for extra work on {plate}.",
     "SERVICE_FINISHED": "MacJit: {mechanic} finished work on {plate}. Now in QA.",
     "QA_DONE": "MacJit: {plate} passed QA{tester_part}. Ready for pickup!",
+    "QA_FAIL": "MacJit: QA FAILED for {plate}. Reason(s): {qa_fail_reasons}. Please fix and resubmit.",
     "BILLED": "MacJit: Bill for {plate} generated. Payment link sent on WhatsApp/SMS.",
     "PAID": "MacJit: Payment received for {plate}. Thanks for choosing us — drive safe!",
 }
@@ -1125,6 +1129,39 @@ async def qa_done(booking_id: str, user=Depends(require_roles("tester"))):
     b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
     recipients = await get_recipients_for_booking(b, include_tester=True)
     await publish_event("QA_DONE", b, recipients)
+    return b
+
+
+class QAFailIn(BaseModel):
+    reasons: List[str]
+    notes: Optional[str] = None
+
+
+@api.post("/bookings/{booking_id}/qa-fail")
+async def qa_fail(booking_id: str, body: QAFailIn, user=Depends(require_roles("tester"))):
+    if not body.reasons:
+        raise HTTPException(400, "At least one fail reason is required")
+    upd = {
+        "status": "IN_SERVICE",
+        "qa_fail_reasons": body.reasons,
+        "qa_fail_notes": body.notes or "",
+        "qa_failed_at": now_iso(),
+        "qa_fail_tester_id": user["id"],
+        "qa_fail_tester_name": user["name"],
+    }
+    await db.bookings.update_one({"id": booking_id}, {"$set": upd})
+    b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+    # Notify mechanic via in-app + SMS (not customer)
+    recipients = await get_recipients_for_booking(b, include_tester=True, include_reception=True)
+    await publish_event("QA_FAIL", b, recipients)
+    mechanic_phone = b.get("mechanic_phone") or ""
+    if mechanic_phone:
+        reasons_str = ", ".join(body.reasons)
+        msg = (f"MacJit QA FAILED: {b.get('plate_number')} — Reason(s): {reasons_str}. "
+               f"Please fix and resubmit for QA.")
+        if body.notes:
+            msg += f" Notes: {body.notes}"
+        await TwilioAdapter.send_sms(mechanic_phone, msg)
     return b
 
 
