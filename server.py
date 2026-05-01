@@ -3212,9 +3212,34 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
 
 
 # ---------- Seeding ----------
-DEMO_USERS = [
-    {"username": "9353401156", "password": "macjit@123", "name": "Prashant Tiwary", "role": "admin", "phone": "+919353401156"},
-]
+# SECURITY NOTE: Admin seeding is DISABLED by default for security.
+# To enable admin seeding, set SEED_ADMIN=true and configure ADMIN_* environment variables.
+# This prevents accidental creation of default admin accounts in production.
+
+# Only seed admin if explicitly enabled
+SEED_ADMIN = os.environ.get('SEED_ADMIN', '').lower() == 'true'
+
+if SEED_ADMIN:
+    DEFAULT_ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME')
+    DEFAULT_ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD')
+    DEFAULT_ADMIN_NAME = os.environ.get('ADMIN_NAME')
+    DEFAULT_ADMIN_PHONE = os.environ.get('ADMIN_PHONE')
+
+    if not all([DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD, DEFAULT_ADMIN_NAME, DEFAULT_ADMIN_PHONE]):
+        logger.error("SEED_ADMIN=true but ADMIN_* environment variables not set. Skipping admin seeding.")
+        DEMO_USERS = []
+    else:
+        DEMO_USERS = [{
+            "username": DEFAULT_ADMIN_USERNAME,
+            "password": DEFAULT_ADMIN_PASSWORD,
+            "name": DEFAULT_ADMIN_NAME,
+            "role": "admin",
+            "phone": DEFAULT_ADMIN_PHONE
+        }]
+        logger.info("Admin seeding enabled via SEED_ADMIN=true")
+else:
+    DEMO_USERS = []
+    logger.info("Admin seeding disabled (set SEED_ADMIN=true to enable)")
 
 DEMO_BAYS = [
     {"id": "bay-1", "name": "Bay A1", "type": "general"},
@@ -3281,22 +3306,31 @@ async def startup():
     if inv_del.deleted_count:
         logger.info(f"Cleaned up {inv_del.deleted_count} legacy 2-wheeler inventory items")
     # Idempotently seed/upgrade demo users (force admin role + correct password hash)
-    for u in DEMO_USERS:
-        existing = await db.users.find_one({"username": u["username"]})
-        h = await hash_password(u["password"])
-        if existing:
-            await db.users.update_one(
-                {"id": existing["id"]},
-                {"$set": {"name": u["name"], "role": u["role"], "phone": u["phone"],
-                          "password_hash": h}}
-            )
-            logger.info(f"Upgraded existing user {u['username']} to {u['role']}")
-        else:
-            doc = {"id": str(uuid.uuid4()), "username": u["username"], "name": u["name"],
-                   "role": u["role"], "phone": u["phone"],
-                   "password_hash": h, "created_at": now_iso()}
-            await db.users.insert_one(doc)  # seed users stored without encryption
-            logger.info(f"Seeded admin {u['username']}")
+    if DEMO_USERS:
+        for u in DEMO_USERS:
+            existing = await db.users.find_one({"username": u["username"]})
+            h = await hash_password(u["password"])
+            if existing:
+                # Update existing admin user
+                update_data = {"name": u["name"], "role": u["role"], "phone": u["phone"], "password_hash": h}
+                # If password changed, force reset
+                if not existing.get("must_reset_password"):
+                    update_data["must_reset_password"] = True
+                await db.users.update_one(
+                    {"id": existing["id"]},
+                    {"$set": update_data}
+                )
+                logger.info(f"Upgraded existing user {u['username']} to {u['role']}")
+            else:
+                # Create new admin user with forced password reset
+                doc = {"id": str(uuid.uuid4()), "username": u["username"], "name": u["name"],
+                       "role": u["role"], "phone": u["phone"],
+                       "password_hash": h, "created_at": now_iso(),
+                       "must_reset_password": True}
+                await db.users.insert_one(doc)  # seed users stored without encryption
+                logger.warning(f"*** SECURITY WARNING *** Seeded admin user {u['username']} with password from environment variables. CHANGE IMMEDIATELY after first login!")
+    else:
+        logger.info("No admin users to seed (admin seeding disabled)")
 
     DEMO_SERVICES = [
         {"key": "general", "name": "General Service", "duration_min": 120, "base_price": 1200, "active": True},
