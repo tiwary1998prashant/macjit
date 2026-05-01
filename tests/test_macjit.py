@@ -2,9 +2,20 @@
 import os
 import asyncio
 import json
+from pathlib import Path
+
 import pytest
 import requests
 import websockets
+from dotenv import load_dotenv
+
+# Load test environment variables from .env.test
+test_env_file = Path(__file__).parent.parent / ".env.test"
+if test_env_file.exists():
+    load_dotenv(test_env_file, override=True)
+else:
+    # Fallback to example if .env.test doesn't exist
+    load_dotenv(Path(__file__).parent.parent / ".env.test.example", override=True)
 
 BASE_URL = os.environ.get('REACT_APP_BACKEND_URL', '').rstrip('/')
 if not BASE_URL:

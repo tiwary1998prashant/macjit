@@ -12,23 +12,36 @@ import io
 import os
 import uuid
 import csv
+from pathlib import Path
 
 import pytest
 import requests
+from dotenv import load_dotenv
+
+# Load test environment variables from .env.test
+test_env_file = Path(__file__).parent.parent / ".env.test"
+if test_env_file.exists():
+    load_dotenv(test_env_file, override=True)
+else:
+    # Fallback to example if .env.test doesn't exist
+    load_dotenv(Path(__file__).parent.parent / ".env.test.example", override=True)
 
 BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "").rstrip("/")
 if not BASE_URL:
     # Fallback for testing inside container
-    with open("/app/frontend/.env") as f:
-        for line in f:
-            if line.startswith("REACT_APP_BACKEND_URL="):
-                BASE_URL = line.split("=", 1)[1].strip().rstrip("/")
-                break
+    try:
+        with open("/app/frontend/.env") as f:
+            for line in f:
+                if line.startswith("REACT_APP_BACKEND_URL="):
+                    BASE_URL = line.split("=", 1)[1].strip().rstrip("/")
+                    break
+    except FileNotFoundError:
+        BASE_URL = "http://localhost:8000"
 
 API = f"{BASE_URL}/api"
-ADMIN_USER = "9353401156"
-ADMIN_PHONE = "+919353401156"
-ADMIN_PWD = "macjit@123"
+ADMIN_USER = os.environ.get("ADMIN_USERNAME", "test-admin")
+ADMIN_PHONE = os.environ.get("ADMIN_PHONE", "+919999999999")
+ADMIN_PWD = os.environ.get("ADMIN_PASSWORD", "test-password-123")
 
 
 # ---------- fixtures ----------
