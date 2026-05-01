@@ -21,6 +21,16 @@ from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, ConfigDict
+import hashlib
+import base64
+import hmac
+try:
+    from cryptography.fernet import Fernet, InvalidToken as FernetInvalidToken
+    _cryptography_available = True
+except ImportError:
+    _cryptography_available = False
+    Fernet = None
+    FernetInvalidToken = Exception
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -34,6 +44,66 @@ if not (mongo_url.startswith('mongodb://') or mongo_url.startswith('mongodb+srv:
     mongo_url = 'mongodb+srv://' + mongo_url
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME'].strip().strip('"').strip("'")]
+
+# ---------- Field-level Encryption ----------
+ENCRYPTION_KEY = os.environ.get("ENCRYPTION_KEY", "")
+_fernet_instance = None
+
+
+def _get_fernet():
+    global _fernet_instance
+    if _fernet_instance is None and ENCRYPTION_KEY and _cryptography_available:
+        key_bytes = ENCRYPTION_KEY.encode()
+        # Accept a raw 32-byte key or a 44-char base64 Fernet key
+        if len(ENCRYPTION_KEY) == 44 and ENCRYPTION_KEY.endswith("="):
+            fkey = ENCRYPTION_KEY.encode()
+        else:
+            # Pad/truncate to 32 bytes and base64url-encode into a valid Fernet key
+            raw = (key_bytes * 4)[:32]
+            fkey = base64.urlsafe_b64encode(raw)
+        _fernet_instance = Fernet(fkey)
+    return _fernet_instance
+
+
+def encrypt_field(v: Optional[str]) -> Optional[str]:
+    """Encrypt a string field; returns 'enc:<base64>' or original if no key."""
+    if not v or not isinstance(v, str):
+        return v
+    f = _get_fernet()
+    if not f:
+        return v
+    return "enc:" + f.encrypt(v.encode()).decode()
+
+
+def decrypt_field(v: Optional[str]) -> Optional[str]:
+    """Decrypt an 'enc:<base64>' field; returns original string or value unchanged."""
+    if not v or not isinstance(v, str) or not v.startswith("enc:"):
+        return v
+    f = _get_fernet()
+    if not f:
+        return v
+    try:
+        return f.decrypt(v[4:].encode()).decode()
+    except Exception:
+        return v
+
+
+def field_hash(v: str) -> str:
+    """Deterministic SHA-256 hash for queryable encrypted fields."""
+    salt = ENCRYPTION_KEY or "macjit-no-key-salt"
+    return hashlib.sha256((salt + (v or "")).encode()).hexdigest()
+
+
+def decrypt_doc(doc: dict, *fields: str) -> dict:
+    """Decrypt named fields in a document dict in-place."""
+    if not doc:
+        return doc
+    for f in fields:
+        if f in doc:
+            doc[f] = decrypt_field(doc[f])
+    return doc
+
+
 
 # ---------- Auth ----------
 JWT_SECRET = os.environ.get('JWT_SECRET', 'macjit-dev-secret-change-in-prod')
@@ -201,6 +271,8 @@ class ShopSaleIn(BaseModel):
     customer_phone: Optional[str] = ""
     items: List[ShopSaleLine]
     payment_method: str = "cash"  # cash | razorpay
+    fitting_charge: float = 0.0   # labour/fitting charge in ₹
+    gst_percent: float = 0.0      # GST percentage, e.g. 18 for 18%
 
 
 class RefundIn(BaseModel):
@@ -208,6 +280,15 @@ class RefundIn(BaseModel):
     reason: str
     items: Optional[List[ShopSaleLine]] = None  # if None → full refund of all sale items
 
+
+
+
+class ServiceIn(BaseModel):
+    key: str            # unique slug, e.g. "oil-change"
+    name: str           # display label, e.g. "Oil & Filter Change"
+    duration_min: int   # estimated duration in minutes
+    base_price: float   # base charge (₹)
+    active: bool = True
 
 class RefundDecision(BaseModel):
     decision: str  # approved | rejected
@@ -353,29 +434,57 @@ class TwilioAdapter:
 
 class RazorpayAdapter:
     enabled = bool(os.environ.get("RAZORPAY_KEY_ID") and os.environ.get("RAZORPAY_KEY_SECRET"))
+    WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "")
 
     @classmethod
-    async def create_payment_link(cls, amount: float, booking_id: str, customer_phone: str = "") -> str:
+    def verify_webhook_signature(cls, body: bytes, signature: str) -> bool:
+        """Verify Razorpay webhook signature (HMAC-SHA256 of raw body with webhook secret)."""
+        if not cls.WEBHOOK_SECRET:
+            logger.warning("[RAZORPAY-WEBHOOK] No webhook secret configured — skipping signature check")
+            return True  # Allow in dev if secret not set; tighten in prod
+        expected = hmac.new(cls.WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, signature or "")
+
+    @classmethod
+    async def create_payment_link(cls, amount: float, booking_id: str, customer_phone: str = "",
+                                   notes: Optional[Dict[str, Any]] = None) -> str:
+        """Create a Razorpay payment link and return the short URL."""
+        url, _ = await cls.create_payment_link_full(amount, booking_id, customer_phone, notes)
+        return url
+
+    @classmethod
+    async def create_payment_link_full(cls, amount: float, ref_id: str, customer_phone: str = "",
+                                        notes: Optional[Dict[str, Any]] = None) -> tuple:
+        """Create a Razorpay payment link. Returns (short_url, rzp_link_id)."""
         if cls.enabled:
             try:
                 import httpx
+                payload = {
+                    "amount": int(amount * 100),
+                    "currency": "INR",
+                    "description": f"MacJit #{ref_id[:8]}",
+                    "customer": {"contact": customer_phone} if customer_phone else {},
+                    "notify": {"sms": bool(customer_phone), "whatsapp": bool(customer_phone)},
+                    "notes": {**(notes or {}), "ref_id": ref_id},
+                    "callback_url": os.environ.get("PUBLIC_URL", "") + "/api/webhooks/razorpay/redirect",
+                    "callback_method": "get",
+                }
                 async with httpx.AsyncClient(timeout=10) as cli:
                     r = await cli.post(
                         "https://api.razorpay.com/v1/payment_links",
-                        json={
-                            "amount": int(amount * 100),
-                            "currency": "INR",
-                            "description": f"Booking {booking_id[:8]}",
-                            "customer": {"contact": customer_phone} if customer_phone else {},
-                            "notify": {"sms": bool(customer_phone), "whatsapp": bool(customer_phone)},
-                        },
+                        json=payload,
                         auth=(os.environ["RAZORPAY_KEY_ID"], os.environ["RAZORPAY_KEY_SECRET"]),
                     )
-                    return r.json().get("short_url", f"https://rzp.io/error/{booking_id}")
+                    data = r.json()
+                    rzp_id = data.get("id", "")
+                    short_url = data.get("short_url", f"https://rzp.io/error/{ref_id}")
+                    logger.info(f"[RAZORPAY] Created link {rzp_id} for ref={ref_id} amount={amount}")
+                    return short_url, rzp_id
             except Exception as e:
                 logger.error(f"[RAZORPAY-ERR] {e}")
         link_id = uuid.uuid4().hex[:10]
-        return f"https://rzp.io/test/{link_id}?amount={amount}&booking={booking_id}"
+        mock_url = f"https://rzp.io/test/{link_id}?amount={amount}&ref={ref_id}"
+        return mock_url, f"mock_{link_id}"
 
 
 # ---------- Event Pipeline ----------
@@ -502,7 +611,8 @@ async def auto_assign_booking(booking_id: str) -> Optional[dict]:
     booking = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
     if not booking:
         return None
-    duration_min = SERVICE_DURATION_BY_TYPE.get(booking.get("service_type", "general"), SERVICE_DURATION_MIN)
+    svc_doc = await db.services.find_one({"key": booking.get("service_type", "general")}, {"_id": 0})
+    duration_min = svc_doc["duration_min"] if svc_doc else SERVICE_DURATION_BY_TYPE.get(booking.get("service_type", "general"), SERVICE_DURATION_MIN)
     mechanics = await db.users.find({"role": "mechanic"}, {"_id": 0}).to_list(100)
     bays = await db.bays.find({}, {"_id": 0}).to_list(100)
     if not mechanics or not bays:
@@ -706,7 +816,8 @@ async def create_booking(data: BookingCreate, user=Depends(require_roles("recept
     booking = {
         "id": str(uuid.uuid4()),
         "customer_id": customer["id"],
-        "customer_name": customer["name"],
+        "customer_name": encrypt_field(customer["name"]),
+        "customer_name_plain": customer["name"],
         "customer_phone": customer["phone"],
         "loyalty_tier": tier,
         "car_make": data.car_make,
@@ -898,7 +1009,7 @@ async def qa_done(booking_id: str, user=Depends(require_roles("tester"))):
 
 def _calculate_bill(b: dict, pricing: Optional[dict], cust: Optional[dict],
                     extra_discount: float = 0.0):
-    base_charge = (pricing or {}).get("base_price") or DEFAULT_PRICES.get(b.get("service_type", "general"), 800)
+    base_charge = (pricing or {}).get("base_price") or DEFAULT_PRICES.get(b.get("service_type", "general"), 800)  # pricing from services DB
     items_total = sum(i.get("subtotal", 0) for i in b.get("items", []))
     extra_cost = b.get("extra_cost", 0) or 0
     subtotal = base_charge + items_total + extra_cost
@@ -929,7 +1040,7 @@ async def bill_preview(booking_id: str, extra_discount: float = 0.0,
     b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
     if not b:
         raise HTTPException(404, "Not found")
-    pricing = await db.service_prices.find_one({"service_type": b.get("service_type")}, {"_id": 0})
+    pricing = await db.services.find_one({"key": b.get("service_type")}, {"_id": 0})
     cust = {"name": b.get("customer_name"), "phone": b.get("customer_phone"),
             "loyalty_tier": b.get("loyalty_tier", "BRONZE")}
     calc = _calculate_bill(b, pricing, cust, extra_discount=extra_discount)
@@ -955,13 +1066,17 @@ async def bill(booking_id: str, data: Optional[dict] = None,
     b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
     if not b:
         raise HTTPException(404, "Not found")
-    pricing = await db.service_prices.find_one({"service_type": b.get("service_type")}, {"_id": 0})
+    pricing = await db.services.find_one({"key": b.get("service_type")}, {"_id": 0})
     cust = {"name": b.get("customer_name"), "phone": b.get("customer_phone"),
             "loyalty_tier": b.get("loyalty_tier", "BRONZE")}
     calc = _calculate_bill(b, pricing, cust, extra_discount=extra_discount)
     bill_amount = calc["bill_amount"]
-    link = await RazorpayAdapter.create_payment_link(bill_amount, booking_id, cust.get("phone") or "")
+    link, rzp_link_id = await RazorpayAdapter.create_payment_link_full(
+        bill_amount, booking_id, cust.get("phone") or "",
+        notes={"type": "service_booking", "booking_id": booking_id}
+    )
     upd = {"status": "BILLED",
+           "rzp_payment_link_id": rzp_link_id,
            "bill_amount": bill_amount,
            "subtotal": calc["subtotal"],
            "discount": calc["discount"],
@@ -1431,6 +1546,53 @@ async def invoice_pdf(booking_id: str):
 DEFAULT_PRICES = {"general": 800, "oil-change": 500, "full-service": 1800, "tire": 600, "engine": 2500}
 LOYALTY_DISCOUNT = {"BRONZE": 0, "SILVER": 5, "GOLD": 10}
 
+
+
+
+# ---------- SERVICES (dynamic, admin-managed) ----------
+@api.get("/services")
+async def list_services(user=Depends(get_current_user)):
+    """Return all services (active and inactive) for display. Reception uses active ones for booking."""
+    return await db.services.find({}, {"_id": 0}).sort("key", 1).to_list(100)
+
+
+@api.get("/services/active")
+async def list_active_services(user=Depends(get_current_user)):
+    """Return only active services (for booking dropdowns)."""
+    return await db.services.find({"active": True}, {"_id": 0}).sort("key", 1).to_list(100)
+
+
+@api.post("/services")
+async def create_service(data: ServiceIn, user=Depends(require_roles("admin"))):
+    existing = await db.services.find_one({"key": data.key})
+    if existing:
+        raise HTTPException(400, f"Service key '{data.key}' already exists. Use PATCH to update.")
+    doc = {"id": str(uuid.uuid4()), **data.model_dump(), "created_at": now_iso()}
+    await db.services.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+
+@api.patch("/services/{service_id}")
+async def update_service(service_id: str, data: dict, user=Depends(require_roles("admin"))):
+    allowed = {"name", "duration_min", "base_price", "active"}
+    upd = {k: v for k, v in data.items() if k in allowed}
+    if not upd:
+        raise HTTPException(400, "Nothing to update. Allowed fields: name, duration_min, base_price, active.")
+    await db.services.update_one({"id": service_id}, {"$set": upd})
+    svc = await db.services.find_one({"id": service_id}, {"_id": 0})
+    if not svc:
+        raise HTTPException(404, "Service not found")
+    return svc
+
+
+@api.delete("/services/{service_id}")
+async def delete_service(service_id: str, user=Depends(require_roles("admin"))):
+    svc = await db.services.find_one({"id": service_id})
+    if not svc:
+        raise HTTPException(404, "Service not found")
+    await db.services.delete_one({"id": service_id})
+    return {"ok": True}
 
 @api.get("/pricing")
 async def list_pricing(user=Depends(get_current_user)):
@@ -2002,18 +2164,35 @@ async def create_sale(data: ShopSaleIn, user=Depends(require_roles("shopkeeper",
         total += subtotal
         await db.inventory.update_one({"id": inv["id"]}, {"$inc": {"stock": -line.qty}})
 
+    fitting_charge = round(max(0.0, float(data.fitting_charge or 0)), 2)
+    gst_percent = round(max(0.0, float(data.gst_percent or 0)), 2)
+    taxable_amount = total + fitting_charge
+    gst_amount = round(taxable_amount * gst_percent / 100, 2)
+    grand_total = round(taxable_amount + gst_amount, 2)
+
     sale_id = str(uuid.uuid4())
     payment_link = None
+    rzp_payment_link_id = None
     if data.payment_method == "razorpay":
-        payment_link = await RazorpayAdapter.create_payment_link(total, sale_id, data.customer_phone or "")
+        notes = {"type": "shop_sale", "sale_id": sale_id,
+                 "customer": data.customer_name or "Walk-in"}
+        payment_link, rzp_payment_link_id = await RazorpayAdapter.create_payment_link_full(
+            grand_total, sale_id, data.customer_phone or "", notes=notes
+        )
 
     sale = {
         "id": sale_id,
         "customer_name": data.customer_name or "Walk-in",
         "customer_phone": data.customer_phone or "",
-        "items": lines, "total": total,
+        "items": lines,
+        "subtotal": total,
+        "fitting_charge": fitting_charge,
+        "gst_percent": gst_percent,
+        "gst_amount": gst_amount,
+        "total": grand_total,
         "payment_method": data.payment_method,
         "payment_link": payment_link,
+        "rzp_payment_link_id": rzp_payment_link_id,
         "paid": data.payment_method == "cash",  # cash assumed paid at counter
         "shopkeeper_id": user["id"], "shopkeeper_name": user["name"],
         "created_at": now_iso(),
@@ -2022,8 +2201,17 @@ async def create_sale(data: ShopSaleIn, user=Depends(require_roles("shopkeeper",
     await db.shop_sales.insert_one(dict(sale))
     sale.pop("_id", None)
     if data.customer_phone:
-        await TwilioAdapter.send_sms(data.customer_phone,
-            f"MacJit bill #{sale_id[:8]} ₹{total}. {payment_link if payment_link else 'Paid at counter.'} Thanks!")
+        if data.payment_method == "razorpay" and payment_link:
+            # Razorpay: send the payment link now; invoice auto-sent after payment via webhook
+            pay_msg = (
+                f"MacJit - Your bill of ₹{grand_total:.0f} is ready.\n"
+                f"Pay securely here: {payment_link}\n"
+                f"Your invoice will be sent to you after payment. Thank you!"
+            )
+            await TwilioAdapter.send_sms(data.customer_phone, pay_msg)
+        else:
+            # Cash / other: payment already done — send full invoice immediately
+            await _send_sale_invoice_whatsapp(sale)
     # notify admin
     admin_ids = [u["id"] async for u in db.users.find({"role": "admin"}, {"_id": 0, "id": 1})]
     await bus.fanout(admin_ids, {"type": "SHOP_SALE", "data": sale, "ts": now_iso()})
@@ -2033,7 +2221,10 @@ async def create_sale(data: ShopSaleIn, user=Depends(require_roles("shopkeeper",
 @api.post("/shop/sales/{sale_id}/pay")
 async def mark_sale_paid(sale_id: str, user=Depends(require_roles("shopkeeper", "admin", "reception"))):
     await db.shop_sales.update_one({"id": sale_id}, {"$set": {"paid": True, "paid_at": now_iso()}})
-    return await db.shop_sales.find_one({"id": sale_id}, {"_id": 0})
+    sale = await db.shop_sales.find_one({"id": sale_id}, {"_id": 0})
+    if sale:
+        await _send_sale_invoice_whatsapp(sale)
+    return sale
 
 
 @api.get("/shop/sales")
@@ -2213,6 +2404,8 @@ async def decide_refund(refund_id: str, data: RefundDecision,
 # ---------- ADMIN TRANSACTIONS (Paytm-style unified history) ----------
 @api.get("/admin/transactions")
 async def admin_transactions(type: str = "all", q: str = "", limit: int = 200,
+                             date_from: Optional[str] = None, date_to: Optional[str] = None,
+                             period: Optional[str] = None,
                              user=Depends(require_roles("admin"))):
     """Unified payment history across services (paid bookings) and shop (paid counter sales).
     Filter `type`: all | service | shop. `q` matches customer name/phone/plate/sku."""
@@ -2282,6 +2475,27 @@ async def admin_transactions(type: str = "all", q: str = "", limit: int = 200,
                 "invoice_url": None,
             })
 
+    # --- Period/date filter ---
+    _now = datetime.now(timezone.utc)
+    if period == "today":
+        date_from = _now.date().isoformat()
+        date_to = date_from
+    elif period == "week":
+        date_from = (_now.date() - timedelta(days=6)).isoformat()
+        date_to = _now.date().isoformat()
+    elif period == "month":
+        date_from = (_now.date() - timedelta(days=29)).isoformat()
+        date_to = _now.date().isoformat()
+    if date_from or date_to:
+        def _in_date_range(t):
+            ts = (t.get("ts") or "")[:10]
+            if date_from and ts < date_from:
+                return False
+            if date_to and ts > date_to:
+                return False
+            return True
+        items = [t for t in items if _in_date_range(t)]
+
     if q:
         ql = q.lower()
         def match(t):
@@ -2347,6 +2561,199 @@ async def list_photos(booking_id: str, user=Depends(get_current_user)):
     return await db.service_photos.find({"booking_id": booking_id}, {"_id": 0}).sort("ts", -1).to_list(50)
 
 
+
+
+
+async def _send_sale_invoice_whatsapp(sale: dict):
+    """Build a formatted invoice from a sale doc and send it via Twilio WhatsApp."""
+    phone = sale.get("customer_phone", "")
+    if not phone:
+        return
+    items = sale.get("items", [])
+    inv_lines = "\n".join(f"  {it['name']} x{it['qty']} = \u20b9{it['subtotal']:.0f}" for it in items)
+    fitting = float(sale.get("fitting_charge") or 0)
+    gst_pct = float(sale.get("gst_percent") or 0)
+    gst_amt = float(sale.get("gst_amount") or 0)
+    grand = float(sale.get("total", 0))
+    fitting_line = f"\n  Fitting charge = \u20b9{fitting:.0f}" if fitting > 0 else ""
+    gst_line = f"\n  GST ({gst_pct}%) = \u20b9{gst_amt:.0f}" if gst_amt > 0 else ""
+    msg = (
+        f"*MacJit Invoice #{sale['id'][:8]}*\n"
+        f"{inv_lines}{fitting_line}{gst_line}\n"
+        f"*Total = \u20b9{grand:.0f}*\n"
+        f"Payment: {sale.get('payment_method','cash').upper()} — PAID \u2705\nThank you! \U0001f697"
+    )
+    await TwilioAdapter.send_whatsapp(phone, msg)
+
+
+# ---------- Razorpay Webhook ----------
+@app.post("/api/webhooks/razorpay")
+async def razorpay_webhook(request: Request):
+    """
+    Razorpay sends POST with X-Razorpay-Signature header.
+    Events handled:
+      - payment_link.paid    → mark shop sale paid + send invoice via WhatsApp
+      - payment.captured     → same fallback lookup
+      - payment.authorized   → for bookings: mark booking as paid
+    Configure in Razorpay Dashboard → Settings → Webhooks → Add URL:
+        https://<your-domain>/api/webhooks/razorpay
+    Secret: set RAZORPAY_WEBHOOK_SECRET env var (same as dashboard).
+    """
+    body = await request.body()
+    signature = request.headers.get("X-Razorpay-Signature", "")
+
+    if not RazorpayAdapter.verify_webhook_signature(body, signature):
+        logger.warning("[RAZORPAY-WEBHOOK] Invalid signature — rejected")
+        raise HTTPException(400, "Invalid webhook signature")
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        raise HTTPException(400, "Invalid JSON")
+
+    event = payload.get("event", "")
+    logger.info(f"[RAZORPAY-WEBHOOK] event={event}")
+
+    # ---- payment_link.paid (primary event for payment links) ----
+    if event == "payment_link.paid":
+        pl_entity = payload.get("payload", {}).get("payment_link", {}).get("entity", {})
+        rzp_link_id = pl_entity.get("id", "")
+        notes = pl_entity.get("notes") or {}
+        ref_id = notes.get("ref_id") or notes.get("sale_id") or ""
+        txn_type = notes.get("type", "")
+        rzp_payment_id = payload.get("payload", {}).get("payment", {}).get("entity", {}).get("id", "")
+        amount_paise = pl_entity.get("amount_paid") or pl_entity.get("amount") or 0
+        amount = amount_paise / 100
+
+        logger.info(f"[RAZORPAY-WEBHOOK] payment_link.paid link={rzp_link_id} ref={ref_id} type={txn_type} payment_id={rzp_payment_id}")
+
+        if txn_type == "shop_sale" or not txn_type:
+            # Try lookup by rzp_payment_link_id first, then by sale_id in notes
+            sale = None
+            if rzp_link_id:
+                sale = await db.shop_sales.find_one({"rzp_payment_link_id": rzp_link_id}, {"_id": 0})
+            if not sale and ref_id:
+                sale = await db.shop_sales.find_one({"id": ref_id}, {"_id": 0})
+            if sale and not sale.get("paid"):
+                now_ts = now_iso()
+                await db.shop_sales.update_one({"id": sale["id"]}, {"$set": {
+                    "paid": True,
+                    "paid_at": now_ts,
+                    "rzp_payment_id": rzp_payment_id,
+                    "rzp_amount_received": amount,
+                }})
+                sale["paid"] = True
+                sale["paid_at"] = now_ts
+                # Send formatted WhatsApp invoice
+                await _send_sale_invoice_whatsapp(sale)
+                # Notify admin/shopkeeper via WebSocket
+                admin_ids = [u["id"] async for u in db.users.find({"role": {"$in": ["admin", "shopkeeper"]}}, {"_id": 0, "id": 1})]
+                await bus.fanout(admin_ids, {
+                    "type": "SHOP_PAYMENT_RECEIVED",
+                    "data": {"sale_id": sale["id"], "amount": amount, "payment_id": rzp_payment_id},
+                    "ts": now_iso()
+                })
+                logger.info(f"[RAZORPAY-WEBHOOK] Shop sale {sale['id']} marked PAID — invoice sent to {sale.get('customer_phone')}")
+            elif sale and sale.get("paid"):
+                logger.info(f"[RAZORPAY-WEBHOOK] Sale {sale.get('id')} already marked paid — skipping")
+            else:
+                logger.warning(f"[RAZORPAY-WEBHOOK] Could not find shop sale for link={rzp_link_id} ref={ref_id}")
+
+        elif txn_type == "service_booking":
+            booking_id = notes.get("booking_id") or ref_id
+            booking = None
+            if rzp_link_id:
+                booking = await db.bookings.find_one({"rzp_payment_link_id": rzp_link_id}, {"_id": 0})
+            if not booking and booking_id:
+                booking = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+            if booking and not booking.get("paid"):
+                await db.bookings.update_one({"id": booking["id"]}, {"$set": {
+                    "paid": True,
+                    "status": "PAID",
+                    "paid_at": now_iso(),
+                    "payment_method": "razorpay",
+                    "razorpay_payment_id": rzp_payment_id,
+                }})
+                updated = await db.bookings.find_one({"id": booking["id"]}, {"_id": 0})
+                recipients = await get_recipients_for_booking(updated)
+                await publish_event("PAID", updated, recipients)
+                logger.info(f"[RAZORPAY-WEBHOOK] Booking {booking['id']} marked PAID")
+            elif booking:
+                logger.info(f"[RAZORPAY-WEBHOOK] Booking already paid — skipping")
+
+    # ---- payment.captured (fallback for orders / older flows) ----
+    elif event == "payment.captured":
+        payment = payload.get("payload", {}).get("payment", {}).get("entity", {})
+        rzp_payment_id = payment.get("id", "")
+        notes = payment.get("notes") or {}
+        ref_id = notes.get("ref_id") or ""
+        txn_type = notes.get("type", "")
+        amount = (payment.get("amount") or 0) / 100
+
+        if txn_type == "shop_sale" and ref_id:
+            sale = await db.shop_sales.find_one({"id": ref_id}, {"_id": 0})
+            if sale and not sale.get("paid"):
+                await db.shop_sales.update_one({"id": ref_id}, {"$set": {
+                    "paid": True, "paid_at": now_iso(),
+                    "rzp_payment_id": rzp_payment_id,
+                    "rzp_amount_received": amount,
+                }})
+                sale["paid"] = True
+                await _send_sale_invoice_whatsapp(sale)
+                logger.info(f"[RAZORPAY-WEBHOOK] payment.captured → shop sale {ref_id} PAID")
+
+    return {"status": "ok"}
+
+
+@app.get("/api/webhooks/razorpay/redirect")
+async def razorpay_redirect(razorpay_payment_id: Optional[str] = None,
+                             razorpay_payment_link_id: Optional[str] = None,
+                             razorpay_payment_link_status: Optional[str] = None,
+                             razorpay_signature: Optional[str] = None):
+    """
+    Razorpay callback redirect after customer completes payment on the payment page.
+    Razorpay appends query params: razorpay_payment_id, razorpay_payment_link_id,
+    razorpay_payment_link_status, razorpay_signature.
+    We verify the signature and mark the sale/booking paid immediately (no wait for webhook).
+    """
+    from fastapi.responses import RedirectResponse
+
+    if razorpay_payment_link_status != "paid":
+        logger.info(f"[RAZORPAY-REDIRECT] status={razorpay_payment_link_status} — not paid yet")
+        return RedirectResponse(url=os.environ.get("PUBLIC_URL", "/") + "?payment=cancelled")
+
+    # Verify redirect signature: HMAC-SHA256(payment_link_id|payment_link_reference_id|payment_link_status|payment_id)
+    if RazorpayAdapter.WEBHOOK_SECRET and razorpay_payment_id and razorpay_payment_link_id:
+        msg = f"{razorpay_payment_link_id}|{razorpay_payment_link_id}|{razorpay_payment_link_status}|{razorpay_payment_id}"
+        expected = hmac.new(RazorpayAdapter.WEBHOOK_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, razorpay_signature or ""):
+            logger.warning("[RAZORPAY-REDIRECT] Signature mismatch")
+            raise HTTPException(400, "Invalid signature")
+
+    # Find and mark sale paid by rzp_payment_link_id
+    if razorpay_payment_link_id:
+        sale = await db.shop_sales.find_one({"rzp_payment_link_id": razorpay_payment_link_id}, {"_id": 0})
+        if sale and not sale.get("paid"):
+            await db.shop_sales.update_one({"id": sale["id"]}, {"$set": {
+                "paid": True, "paid_at": now_iso(),
+                "rzp_payment_id": razorpay_payment_id,
+            }})
+            sale["paid"] = True
+            await _send_sale_invoice_whatsapp(sale)
+            logger.info(f"[RAZORPAY-REDIRECT] Sale {sale['id']} marked paid via redirect")
+        # Also check bookings
+        booking = await db.bookings.find_one({"rzp_payment_link_id": razorpay_payment_link_id}, {"_id": 0})
+        if booking and not booking.get("paid"):
+            await db.bookings.update_one({"id": booking["id"]}, {"$set": {
+                "paid": True, "status": "PAID", "paid_at": now_iso(),
+                "payment_method": "razorpay", "razorpay_payment_id": razorpay_payment_id,
+            }})
+            updated = await db.bookings.find_one({"id": booking["id"]}, {"_id": 0})
+            recipients = await get_recipients_for_booking(updated)
+            await publish_event("PAID", updated, recipients)
+            logger.info(f"[RAZORPAY-REDIRECT] Booking {booking['id']} marked paid via redirect")
+
+    return RedirectResponse(url=os.environ.get("PUBLIC_URL", "/") + "?payment=success")
 
 # ---------- WebSocket ----------
 @app.websocket("/api/ws/{token}")
@@ -2456,8 +2863,23 @@ async def startup():
             doc = {"id": str(uuid.uuid4()), "username": u["username"], "name": u["name"],
                    "role": u["role"], "phone": u["phone"],
                    "password_hash": h, "created_at": now_iso()}
-            await db.users.insert_one(doc)
+            await db.users.insert_one(doc)  # seed users stored without encryption
             logger.info(f"Seeded admin {u['username']}")
+
+    DEMO_SERVICES = [
+        {"key": "general", "name": "General Service", "duration_min": 120, "base_price": 1200, "active": True},
+        {"key": "oil-change", "name": "Oil & Filter Change", "duration_min": 45, "base_price": 800, "active": True},
+        {"key": "full-service", "name": "Full Service", "duration_min": 210, "base_price": 3500, "active": True},
+        {"key": "ac-service", "name": "AC Service", "duration_min": 90, "base_price": 1500, "active": True},
+        {"key": "alignment", "name": "Wheel Alignment & Balancing", "duration_min": 60, "base_price": 700, "active": True},
+        {"key": "brake", "name": "Brake Service", "duration_min": 75, "base_price": 1000, "active": True},
+        {"key": "engine", "name": "Engine Repair / Diagnostics", "duration_min": 240, "base_price": 2500, "active": True},
+    ]
+    if await db.services.count_documents({}) == 0:
+        for s in DEMO_SERVICES:
+            await db.services.insert_one({"id": str(uuid.uuid4()), **s, "created_at": now_iso()})
+        logger.info(f"Seeded {len(DEMO_SERVICES)} default services")
+
     if await db.bays.count_documents({}) == 0:
         for b in DEMO_BAYS:
             await db.bays.insert_one({**b, "created_at": now_iso()})
