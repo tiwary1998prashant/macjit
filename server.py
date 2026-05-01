@@ -24,6 +24,8 @@ from pydantic import BaseModel, Field, ConfigDict
 import hashlib
 import base64
 import hmac
+import random
+import re
 try:
     from cryptography.fernet import Fernet, InvalidToken as FernetInvalidToken
     _cryptography_available = True
@@ -92,6 +94,72 @@ def field_hash(v: str) -> str:
     """Deterministic SHA-256 hash for queryable encrypted fields."""
     salt = ENCRYPTION_KEY or "macjit-no-key-salt"
     return hashlib.sha256((salt + (v or "")).encode()).hexdigest()
+
+
+# ---------- NoSQL Injection Prevention ----------
+_MONGO_OP_RE = re.compile(r"^\$")
+
+def _sanitize_value(v):
+    """Recursively remove MongoDB operator keys from dicts/lists to prevent NoSQL injection."""
+    if isinstance(v, dict):
+        return {k: _sanitize_value(val) for k, val in v.items() if not _MONGO_OP_RE.match(str(k))}
+    if isinstance(v, list):
+        return [_sanitize_value(i) for i in v]
+    return v
+
+
+def sanitize_str(v: Optional[str], max_len: int = 500) -> Optional[str]:
+    """Strip and truncate a string input; reject if it contains MongoDB operator patterns."""
+    if v is None:
+        return None
+    v = str(v).strip()[:max_len]
+    return v
+
+
+# ---------- OTP Store (in-memory, 10-min TTL) ----------
+_approval_otps: Dict[str, dict] = {}  # booking_id -> {otp, phone, exp}
+OTP_TTL_SEC = 600  # 10 minutes
+
+
+def _gen_otp() -> str:
+    return str(random.randint(100000, 999999))
+
+
+def _store_otp(booking_id: str, otp: str, phone: str):
+    _approval_otps[booking_id] = {
+        "otp": otp,
+        "phone": phone,
+        "exp": datetime.now(timezone.utc) + timedelta(seconds=OTP_TTL_SEC),
+    }
+
+
+def _verify_otp(booking_id: str, otp: str) -> bool:
+    entry = _approval_otps.get(booking_id)
+    if not entry:
+        return False
+    if datetime.now(timezone.utc) > entry["exp"]:
+        _approval_otps.pop(booking_id, None)
+        return False
+    if not hmac.compare_digest(entry["otp"], str(otp).strip()):
+        return False
+    _approval_otps.pop(booking_id, None)  # one-time use
+    return True
+
+
+# ---------- Simple Rate Limiter ----------
+_rate_store: Dict[str, list] = {}  # key -> [timestamps]
+
+
+def _rate_check(key: str, limit: int, window_sec: int) -> bool:
+    """Returns True if allowed, False if rate limit exceeded."""
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(seconds=window_sec)
+    hits = [t for t in _rate_store.get(key, []) if t > cutoff]
+    if len(hits) >= limit:
+        return False
+    hits.append(now)
+    _rate_store[key] = hits
+    return True
 
 
 def decrypt_doc(doc: dict, *fields: str) -> dict:
@@ -536,10 +604,16 @@ async def publish_event(event_type: str, booking: dict, recipients: List[str], e
     customer_phone = booking.get("customer_phone")
     if customer_phone and event_type in CUSTOMER_NOTIFY_EVENTS:
         msg = EVENT_BODIES.get(event_type, "").format(**_ctx)
-        # Append a tracking link so the customer can open their bill / status page.
         public_url = os.environ.get("PUBLIC_URL") or os.environ.get("APP_URL") or ""
         plate = booking.get("plate_number", "")
-        if public_url and plate:
+        # For BILLED: include the actual Razorpay payment link
+        if event_type == "BILLED":
+            pay_link = extra.get("payment_link") or booking.get("payment_link") or ""
+            if pay_link:
+                msg += f"\nPay securely: {pay_link}"
+            elif public_url and plate:
+                msg += f"\nTrack & pay: {public_url}/track?plate={plate}"
+        elif public_url and plate:
             msg += f"\nTrack & pay: {public_url}/track?plate={plate}"
         await TwilioAdapter.send_whatsapp(customer_phone, msg)
 
@@ -694,10 +768,13 @@ async def get_recipients_for_booking(booking: dict, include_customer=True, inclu
 
 # ---------- AUTH ROUTES ----------
 @api.post("/auth/login")
-async def login(data: LoginIn):
+async def login(data: LoginIn, request: Request):
     """Staff-only login (admin / reception / mechanic / tester / shopkeeper).
     Customers do NOT log in — they track via vehicle number on the public page."""
-    q = {"username": data.username} if data.username else {"phone": data.phone}
+    ip = request.client.host if request.client else "unknown"
+    if not _rate_check(f"login:{ip}", limit=10, window_sec=60):
+        raise HTTPException(429, "Too many login attempts — try again in a minute")
+    q = {"username": sanitize_str(data.username)} if data.username else {"phone": sanitize_str(data.phone)}
     user = await db.users.find_one(q)
     if not user or not await verify_password(data.password, user["password_hash"]):
         raise HTTPException(401, "Invalid credentials")
@@ -746,8 +823,11 @@ def _normalize_phone(p: str) -> str:
 
 
 @api.post("/auth/reset-request")
-async def reset_request(data: dict):
-    phone = data.get("phone")
+async def reset_request(data: dict, request: Request):
+    phone = sanitize_str(data.get("phone"))
+    ip = request.client.host if request.client else "unknown"
+    if not _rate_check(f"reset:{ip}", limit=5, window_sec=300):
+        raise HTTPException(429, "Too many reset requests — try again in 5 minutes")
     user = await db.users.find_one({"phone": phone})
     if not user:
         return {"ok": True}  # silent
@@ -957,20 +1037,61 @@ async def request_approval(booking_id: str, data: ApprovalReq, user=Depends(requ
     upd = {"approval_pending": True, "approval_reason": data.reason, "extra_cost": data.extra_cost}
     await db.bookings.update_one({"id": booking_id}, {"$set": upd})
     b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+    # Generate OTP and send via SMS to customer for secure approval
+    cust_phone = b.get("customer_phone")
+    if cust_phone:
+        otp = _gen_otp()
+        _store_otp(booking_id, otp, cust_phone)
+        otp_msg = (
+            f"MacJit OTP: {otp}\n"
+            f"Your mechanic needs approval for extra work on {b.get('plate_number','your car')}.\n"
+            f"Extra cost: \u20B9{data.extra_cost}. Reason: {data.reason}\n"
+            f"Enter this OTP on the tracking page to approve. Valid 10 minutes. Do NOT share."
+        )
+        await TwilioAdapter.send_sms(cust_phone, otp_msg)
     recipients = await get_recipients_for_booking(b)
     await publish_event("APPROVAL_REQUESTED", b, recipients, extra={"reason": data.reason, "extra_cost": data.extra_cost})
     return b
 
 
-@api.post("/bookings/{booking_id}/approve")
-async def approve(booking_id: str, data: Optional[dict] = None):
-    """Public approval — customer must supply their plate number to confirm identity."""
+@api.post("/bookings/{booking_id}/approval-otp/resend")
+async def resend_approval_otp(booking_id: str, request: Request):
+    """Public: resend approval OTP to the customer. Rate-limited per booking."""
+    ip = request.client.host if request.client else "unknown"
+    if not _rate_check(f"otp_resend:{booking_id}:{ip}", limit=3, window_sec=300):
+        raise HTTPException(429, "Too many OTP requests — try again in 5 minutes")
     b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
     if not b:
         raise HTTPException(404, "Not found")
-    plate = ((data or {}).get("plate_number") or "").strip().upper()
-    if not plate or plate != (b.get("plate_number") or "").upper():
-        raise HTTPException(403, "Plate number does not match this booking")
+    if not b.get("approval_pending"):
+        raise HTTPException(400, "No approval pending for this booking")
+    cust_phone = b.get("customer_phone")
+    if not cust_phone:
+        raise HTTPException(400, "No phone on file for this booking")
+    otp = _gen_otp()
+    _store_otp(booking_id, otp, cust_phone)
+    otp_msg = (
+        f"MacJit OTP: {otp}\n"
+        f"Approve extra work on {b.get('plate_number','your car')}. Valid 10 minutes. Do NOT share."
+    )
+    await TwilioAdapter.send_sms(cust_phone, otp_msg)
+    return {"ok": True, "sent_to": cust_phone[-4:].rjust(10, "*")}
+
+
+@api.post("/bookings/{booking_id}/approve")
+async def approve(booking_id: str, data: Optional[dict] = None, request: Request = None):
+    """Public approval — customer must supply the OTP sent to their phone via SMS."""
+    ip = (request.client.host if request and request.client else "unknown")
+    if not _rate_check(f"otp_verify:{booking_id}:{ip}", limit=5, window_sec=300):
+        raise HTTPException(429, "Too many attempts — try again in 5 minutes")
+    b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+    if not b:
+        raise HTTPException(404, "Not found")
+    otp = str((data or {}).get("otp") or "").strip()
+    if not otp:
+        raise HTTPException(400, "OTP is required")
+    if not _verify_otp(booking_id, otp):
+        raise HTTPException(403, "Invalid or expired OTP — request a new one")
     await db.bookings.update_one({"id": booking_id}, {"$set": {"approval_pending": False}})
     b["approval_pending"] = False
     recipients = await get_recipients_for_booking(b)
@@ -1091,6 +1212,13 @@ async def bill(booking_id: str, data: Optional[dict] = None,
     recipients = await get_recipients_for_booking(b)
     await publish_event("BILLED", b, recipients,
                         extra={"bill_amount": bill_amount, "payment_link": link})
+    # Also send payment link via SMS (not just WhatsApp) so customer receives it either way
+    if cust.get("phone") and link:
+        sms_body = (
+            f"MacJit: Your bill of \u20B9{bill_amount:.0f} for {b.get('plate_number','')} is ready.\n"
+            f"Pay securely: {link}"
+        )
+        await TwilioAdapter.send_sms(cust["phone"], sms_body)
     return b
 
 
@@ -1151,6 +1279,8 @@ async def razorpay_webhook(request: Request):
             f"Thanks for choosing MacJit. Drive safe!"
         )
         await TwilioAdapter.send_whatsapp(cust_phone, msg)
+        sms_invoice = f"MacJit: Payment of \u20B9{b.get('bill_amount',0)} received for {b.get('plate_number','')}. Invoice: {invoice_url}"
+        await TwilioAdapter.send_sms(cust_phone, sms_invoice)
     recipients = await get_recipients_for_booking(b)
     await publish_event("PAID", b, recipients)
     return {"ok": True, "booking_id": booking_id}
@@ -1252,6 +1382,8 @@ async def verify_razorpay_payment(booking_id: str, data: dict):
             f"Thanks for choosing MacJit. Drive safe!"
         )
         await TwilioAdapter.send_whatsapp(cust_phone, msg)
+        sms_invoice = f"MacJit: Payment of \u20B9{b.get('bill_amount',0)} received for {b.get('plate_number','')}. Invoice: {invoice_url}"
+        await TwilioAdapter.send_sms(cust_phone, sms_invoice)
     recipients = await get_recipients_for_booking(b)
     await publish_event("PAID", b, recipients)
     return b
@@ -1270,7 +1402,7 @@ async def pay(booking_id: str, data: Optional[dict] = None):
     upd = {"status": "PAID", "paid": True, "paid_at": now_iso()}
     await db.bookings.update_one({"id": booking_id}, {"$set": upd})
     b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
-    # Send invoice link to customer via WhatsApp
+    # Send invoice link to customer via WhatsApp + SMS
     cust_phone = b.get("customer_phone")
     if cust_phone:
         public_url = os.environ.get("PUBLIC_URL") or os.environ.get("APP_URL") or ""
@@ -1285,6 +1417,8 @@ async def pay(booking_id: str, data: Optional[dict] = None):
             f"Thanks for choosing MacJit. Drive safe!"
         )
         await TwilioAdapter.send_whatsapp(cust_phone, msg)
+        sms_invoice = f"MacJit: Payment received for {b.get('plate_number','')}. \u20B9{b.get('bill_amount',0)} paid. Invoice: {invoice_url}"
+        await TwilioAdapter.send_sms(cust_phone, sms_invoice)
     recipients = await get_recipients_for_booking(b)
     await publish_event("PAID", b, recipients)
     return b
@@ -2145,6 +2279,221 @@ async def admin_view_profile(user_id: str, user=Depends(require_roles("admin")))
     return {"user": target, "profile": profile, "timeline": timeline}
 
 
+# ---------- DIGITAL SERVICE CARDS ----------
+
+class ServiceCardPlanIn(BaseModel):
+    name: str
+    price: float
+    services_per_year: int = 3
+    duration_years: int = 1
+    interval_months: int = 4
+    interval_km: int = 0
+    discount_pct: float = 0.0
+    offer_note: str = ""
+    active: bool = True
+
+
+class ServiceCardCreate(BaseModel):
+    plan_id: str
+    customer_name: str
+    customer_phone: str
+    plate_number: Optional[str] = ""
+    car_make: Optional[str] = ""
+    car_model: Optional[str] = ""
+    current_km: Optional[int] = 0
+    notes: Optional[str] = ""
+    discount_override: Optional[float] = None
+
+
+@api.get("/service-card-plans")
+async def list_sc_plans(user=Depends(require_roles("admin", "reception"))):
+    return await db.service_card_plans.find({}, {"_id": 0}).to_list(100)
+
+
+@api.post("/service-card-plans")
+async def create_sc_plan(data: ServiceCardPlanIn, user=Depends(require_roles("admin"))):
+    plan = {"id": str(uuid.uuid4()), **data.model_dump(), "created_at": now_iso(), "created_by": user["id"]}
+    await db.service_card_plans.insert_one(plan)
+    plan.pop("_id", None)
+    return plan
+
+
+@api.put("/service-card-plans/{plan_id}")
+async def update_sc_plan(plan_id: str, data: dict, user=Depends(require_roles("admin"))):
+    data.pop("id", None); data.pop("_id", None)
+    await db.service_card_plans.update_one(
+        {"id": plan_id},
+        {"$set": {**_sanitize_value(data), "updated_at": now_iso()}}
+    )
+    return await db.service_card_plans.find_one({"id": plan_id}, {"_id": 0})
+
+
+@api.get("/service-cards/check-customer/{phone}")
+async def check_customer_card(phone: str, user=Depends(require_roles("admin", "reception"))):
+    norm = _normalize_phone(phone)
+    card = await db.service_cards.find_one(
+        {"customer_phone": norm, "status": "active"}, {"_id": 0}
+    )
+    paid_count = await db.bookings.count_documents({"customer_phone": norm, "paid": True})
+    return {
+        "has_active_card": bool(card),
+        "card": card,
+        "paid_bookings_count": paid_count,
+        "eligible_for_offer": paid_count >= 1 and not card,
+        "is_new_customer": paid_count == 0,
+    }
+
+
+@api.get("/service-cards")
+async def list_service_cards(user=Depends(require_roles("admin", "reception"))):
+    return await db.service_cards.find({}, {"_id": 0}).sort("created_at", -1).to_list(1000)
+
+
+@api.post("/service-cards")
+async def create_service_card(data: ServiceCardCreate, user=Depends(require_roles("admin", "reception"))):
+    plan = await db.service_card_plans.find_one({"id": data.plan_id}, {"_id": 0})
+    if not plan:
+        raise HTTPException(404, "Plan not found")
+    if not plan.get("active"):
+        raise HTTPException(400, "This plan is inactive")
+    now_dt = datetime.now(timezone.utc)
+    end_dt = now_dt + timedelta(days=365 * plan["duration_years"])
+    discount = data.discount_override if data.discount_override is not None else plan["discount_pct"]
+    total_slots = plan["services_per_year"] * plan["duration_years"]
+    phone = _normalize_phone(data.customer_phone)
+    card = {
+        "id": str(uuid.uuid4()),
+        "plan_id": data.plan_id,
+        "plan_name": plan["name"],
+        "customer_name": data.customer_name,
+        "customer_phone": phone,
+        "plate_number": (data.plate_number or "").upper(),
+        "car_make": data.car_make or "",
+        "car_model": data.car_model or "",
+        "current_km": int(data.current_km or 0),
+        "last_km": int(data.current_km or 0),
+        "last_service_date": now_dt.isoformat(),
+        "slots_total": total_slots,
+        "slots_used": 0,
+        "discount_pct": float(discount),
+        "offer_note": plan.get("offer_note", ""),
+        "interval_months": plan["interval_months"],
+        "interval_km": plan["interval_km"],
+        "price_paid": plan["price"],
+        "start_date": now_dt.isoformat(),
+        "end_date": end_dt.isoformat(),
+        "status": "active",
+        "notes": data.notes or "",
+        "created_by": user["id"],
+        "created_at": now_iso(),
+    }
+    await db.service_cards.insert_one(dict(card))
+    card.pop("_id", None)
+    if phone:
+        sms_text = (
+            f"MacJit: Your Digital Service Card '{plan['name']}' is now active!\n"
+            f"Valid: {now_dt.strftime('%d %b %Y')} to {end_dt.strftime('%d %b %Y')}\n"
+            f"Services: {total_slots} | Discount: {discount:.0f}% on every visit.\n"
+        )
+        if plan.get("offer_note"):
+            sms_text += f"Offer: {plan['offer_note']}\n"
+        sms_text += "Thank you for trusting MacJit Garage!"
+        await TwilioAdapter.send_sms(phone, sms_text)
+    return card
+
+
+@api.get("/service-cards/{card_id}")
+async def get_service_card(card_id: str, user=Depends(require_roles("admin", "reception"))):
+    card = await db.service_cards.find_one({"id": card_id}, {"_id": 0})
+    if not card:
+        raise HTTPException(404, "Not found")
+    return card
+
+
+@api.put("/service-cards/{card_id}")
+async def update_service_card(card_id: str, data: dict, user=Depends(require_roles("admin", "reception"))):
+    data.pop("id", None); data.pop("_id", None)
+    clean = _sanitize_value(data)
+    clean["updated_at"] = now_iso()
+    clean["updated_by"] = user["id"]
+    await db.service_cards.update_one({"id": card_id}, {"$set": clean})
+    return await db.service_cards.find_one({"id": card_id}, {"_id": 0})
+
+
+@api.post("/service-cards/{card_id}/use-slot")
+async def use_service_card_slot(card_id: str, data: Optional[dict] = None,
+                                 user=Depends(require_roles("admin", "reception"))):
+    card = await db.service_cards.find_one({"id": card_id})
+    if not card:
+        raise HTTPException(404, "Not found")
+    if card.get("status") != "active":
+        raise HTTPException(400, "Card is not active")
+    if card["slots_used"] >= card["slots_total"]:
+        raise HTTPException(400, "All service slots already used")
+    current_km = int((data or {}).get("current_km") or card.get("current_km", 0))
+    new_used = card["slots_used"] + 1
+    upd: dict = {
+        "slots_used": new_used,
+        "last_service_date": now_iso(),
+        "current_km": current_km,
+        "last_km": current_km,
+        "updated_at": now_iso(),
+    }
+    if new_used >= card["slots_total"]:
+        upd["status"] = "exhausted"
+    await db.service_cards.update_one({"id": card_id}, {"$set": upd})
+    return await db.service_cards.find_one({"id": card_id}, {"_id": 0})
+
+
+@api.post("/service-cards/send-reminders")
+async def send_card_reminders(user=Depends(require_roles("admin", "reception"))):
+    now_dt = datetime.now(timezone.utc)
+    cards = await db.service_cards.find({"status": "active"}, {"_id": 0}).to_list(2000)
+    sent = 0
+    for card in cards:
+        phone = card.get("customer_phone")
+        if not phone:
+            continue
+        due = False
+        last_svc = card.get("last_service_date")
+        if last_svc:
+            try:
+                last_dt = datetime.fromisoformat(last_svc.replace("Z", "+00:00"))
+                months_since = (now_dt - last_dt).days / 30.0
+                if months_since >= card.get("interval_months", 4):
+                    due = True
+            except Exception:
+                pass
+        km_gap = card.get("interval_km", 0)
+        if km_gap > 0:
+            km_diff = card.get("current_km", 0) - card.get("last_km", 0)
+            if km_diff >= km_gap:
+                due = True
+        if due:
+            slots_left = card["slots_total"] - card["slots_used"]
+            msg = (
+                f"MacJit Reminder: Hi {card['customer_name']}, your {card['plan_name']} service is due!\n"
+                f"Vehicle: {card.get('plate_number') or card.get('car_make', '')}\n"
+                f"Services remaining: {slots_left} | Discount: {card['discount_pct']:.0f}%\n"
+                f"Book now at MacJit Garage."
+            )
+            await TwilioAdapter.send_sms(phone, msg)
+            sent += 1
+    return {"ok": True, "reminders_sent": sent}
+
+
+@api.post("/service-cards/remind-custom")
+async def remind_custom(data: dict, user=Depends(require_roles("admin", "reception"))):
+    """Send a one-off SMS reminder to any phone (even without a card)."""
+    phone = sanitize_str(data.get("phone"))
+    message = sanitize_str(data.get("message"), max_len=300)
+    name = sanitize_str(data.get("name", "Customer"), max_len=100)
+    if not phone or not message:
+        raise HTTPException(400, "phone and message are required")
+    await TwilioAdapter.send_sms(_normalize_phone(phone), message)
+    return {"ok": True}
+
+
 # ---------- SHOP MODULE (walk-in parts counter, shares inventory) ----------
 @api.post("/shop/sales")
 async def create_sale(data: ShopSaleIn, user=Depends(require_roles("shopkeeper", "admin", "reception"))):
@@ -2677,6 +3026,12 @@ async def razorpay_webhook(request: Request):
                 updated = await db.bookings.find_one({"id": booking["id"]}, {"_id": 0})
                 recipients = await get_recipients_for_booking(updated)
                 await publish_event("PAID", updated, recipients)
+                # Also send SMS invoice to customer
+                c_phone = updated.get("customer_phone")
+                if c_phone:
+                    pub = os.environ.get("PUBLIC_URL") or os.environ.get("APP_URL") or ""
+                    inv_url = f"{pub}/api/invoices/{updated['id']}.pdf"
+                    await TwilioAdapter.send_sms(c_phone, f"MacJit: Payment of \u20B9{updated.get('bill_amount',0)} received for {updated.get('plate_number','')}. Invoice: {inv_url}")
                 logger.info(f"[RAZORPAY-WEBHOOK] Booking {booking['id']} marked PAID")
             elif booking:
                 logger.info(f"[RAZORPAY-WEBHOOK] Booking already paid — skipping")
@@ -2903,6 +3258,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------- Security Headers Middleware ----------
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response as StarletteResponse
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+        return response
+
+app.add_middleware(SecurityHeadersMiddleware)
 
 # ---------- Serve React frontend (production build) ----------
 from fastapi.staticfiles import StaticFiles
