@@ -124,8 +124,14 @@ OTP_TTL_SEC = 600  # 10 minutes
 def _gen_otp() -> str:
     return str(random.randint(100000, 999999))
 
-
 def _store_otp(booking_id: str, otp: str, phone: str):
+    if not phone:
+        raise Exception("Phone required for OTP")
+
+    # Normalize phone
+    if not phone.startswith("+"):
+        phone = "+91" + phone[-10:]
+
     _approval_otps[booking_id] = {
         "otp": otp,
         "phone": phone,
@@ -137,13 +143,18 @@ def _verify_otp(booking_id: str, otp: str) -> bool:
     entry = _approval_otps.get(booking_id)
     if not entry:
         return False
+
     if datetime.now(timezone.utc) > entry["exp"]:
         _approval_otps.pop(booking_id, None)
         return False
-    if not hmac.compare_digest(entry["otp"], str(otp).strip()):
+
+    # 🔐 Secure compare
+    if not hmac.compare_digest(str(entry["otp"]), str(otp)):
         return False
-    _approval_otps.pop(booking_id, None)  # one-time use
+
+    _approval_otps.pop(booking_id, None)
     return True
+
 
 
 # ---------- Simple Rate Limiter ----------
@@ -489,15 +500,32 @@ class TwilioAdapter:
 
     @classmethod
     async def send_sms(cls, to: str, body: str):
-        if cls.enabled:
-            try:
-                from_num = os.environ.get("TWILIO_SMS_FROM", "+15005550006")
-                code, _ = await cls._post({"From": from_num, "To": to, "Body": body})
-                logger.info(f"[TWILIO-SMS->{to}] {code}")
-            except Exception as e:
-                logger.error(f"[TWILIO-SMS-ERR] {e}")
-        else:
-            logger.info(f"[TWILIO-SMS-MOCK->{to}] {body[:80]}")
+        if not cls.enabled:
+            logger.warning("Twilio not configured")
+            return
+
+        try:
+            import httpx
+
+            if not to.startswith("+"):
+                to = "+91" + to[-10:]
+
+            from_num = os.environ.get("TWILIO_SMS_FROM")
+
+            async with httpx.AsyncClient(timeout=10) as cli:
+                r = await cli.post(
+                    f"https://api.twilio.com/2010-04-01/Accounts/{os.environ['TWILIO_ACCOUNT_SID']}/Messages.json",
+                    data={"From": from_num, "To": to, "Body": body},
+                    auth=(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"]),
+                )
+
+                if r.status_code >= 400:
+                    logger.error(f"[TWILIO ERROR] {r.status_code} {r.text}")
+                else:
+                    logger.info(f"[SMS SENT] {to}")
+
+        except Exception as e:
+            logger.error(f"[TWILIO EXCEPTION] {e}")
 
 
 class RazorpayAdapter:
@@ -505,54 +533,50 @@ class RazorpayAdapter:
     WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "")
 
     @classmethod
-    def verify_webhook_signature(cls, body: bytes, signature: str) -> bool:
-        """Verify Razorpay webhook signature (HMAC-SHA256 of raw body with webhook secret)."""
-        if not cls.WEBHOOK_SECRET:
-            logger.warning("[RAZORPAY-WEBHOOK] No webhook secret configured — skipping signature check")
-            return True  # Allow in dev if secret not set; tighten in prod
-        expected = hmac.new(cls.WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
-        return hmac.compare_digest(expected, signature or "")
-
-    @classmethod
-    async def create_payment_link(cls, amount: float, booking_id: str, customer_phone: str = "",
-                                   notes: Optional[Dict[str, Any]] = None) -> str:
-        """Create a Razorpay payment link and return the short URL."""
-        url, _ = await cls.create_payment_link_full(amount, booking_id, customer_phone, notes)
-        return url
-
-    @classmethod
     async def create_payment_link_full(cls, amount: float, ref_id: str, customer_phone: str = "",
                                         notes: Optional[Dict[str, Any]] = None) -> tuple:
-        """Create a Razorpay payment link. Returns (short_url, rzp_link_id)."""
-        if cls.enabled:
-            try:
-                import httpx
-                payload = {
-                    "amount": int(amount * 100),
-                    "currency": "INR",
-                    "description": f"MacJit #{ref_id[:8]}",
-                    "customer": {"contact": customer_phone} if customer_phone else {},
-                    "notify": {"sms": bool(customer_phone), "whatsapp": bool(customer_phone)},
-                    "notes": {**(notes or {}), "ref_id": ref_id},
-                    "callback_url": os.environ.get("PUBLIC_URL", "") + "/api/webhooks/razorpay/redirect",
-                    "callback_method": "get",
-                }
-                async with httpx.AsyncClient(timeout=10) as cli:
-                    r = await cli.post(
-                        "https://api.razorpay.com/v1/payment_links",
-                        json=payload,
-                        auth=(os.environ["RAZORPAY_KEY_ID"], os.environ["RAZORPAY_KEY_SECRET"]),
-                    )
-                    data = r.json()
-                    rzp_id = data.get("id", "")
-                    short_url = data.get("short_url", f"https://rzp.io/error/{ref_id}")
-                    logger.info(f"[RAZORPAY] Created link {rzp_id} for ref={ref_id} amount={amount}")
-                    return short_url, rzp_id
-            except Exception as e:
-                logger.error(f"[RAZORPAY-ERR] {e}")
-        link_id = uuid.uuid4().hex[:10]
-        mock_url = f"https://rzp.io/test/{link_id}?amount={amount}&ref={ref_id}"
-        return mock_url, f"mock_{link_id}"
+        if not cls.enabled:
+            raise Exception("Razorpay not configured. Check env variables.")
+
+        try:
+            import httpx
+
+            # Ensure phone format
+            if customer_phone and not customer_phone.startswith("+"):
+                customer_phone = "+91" + customer_phone[-10:]
+
+            payload = {
+                "amount": int(amount * 100),
+                "currency": "INR",
+                "description": f"MacJit #{ref_id[:8]}",
+                "customer": {"contact": customer_phone} if customer_phone else {},
+                "notify": {"sms": True, "email": False},
+                "notes": {**(notes or {}), "ref_id": ref_id},
+            }
+
+            async with httpx.AsyncClient(timeout=15) as cli:
+                r = await cli.post(
+                    "https://api.razorpay.com/v1/payment_links",
+                    json=payload,
+                    auth=(os.environ["RAZORPAY_KEY_ID"], os.environ["RAZORPAY_KEY_SECRET"]),
+                )
+
+                # 🔥 CRITICAL FIX
+                if r.status_code >= 400:
+                    logger.error(f"[RAZORPAY ERROR] {r.status_code} {r.text}")
+                    raise Exception(f"Razorpay API failed: {r.text}")
+
+                data = r.json()
+
+                if not data.get("short_url"):
+                    raise Exception(f"Invalid Razorpay response: {data}")
+
+                return data["short_url"], data.get("id", "")
+
+        except Exception as e:
+            logger.error(f"[RAZORPAY-EXCEPTION] {e}")
+            raise HTTPException(500, f"Payment link generation failed: {str(e)}")
+
 
 
 # ---------- Event Pipeline ----------
@@ -1217,47 +1241,48 @@ async def bill_preview(booking_id: str, extra_discount: float = 0.0,
 @api.post("/bookings/{booking_id}/bill")
 async def bill(booking_id: str, data: Optional[dict] = None,
                user=Depends(require_roles("reception", "admin"))):
-    """Confirm-and-send. Reception is expected to have called /bill-preview first.
-    Optional body: {extra_discount: float}.
-    """
-    extra_discount = float((data or {}).get("extra_discount") or 0)
+
     b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
     if not b:
         raise HTTPException(404, "Not found")
-    pricing = await db.services.find_one({"key": b.get("service_type")}, {"_id": 0})
-    cust = {"name": b.get("customer_name"), "phone": b.get("customer_phone"),
-            "loyalty_tier": b.get("loyalty_tier", "BRONZE")}
-    calc = _calculate_bill(b, pricing, cust, extra_discount=extra_discount)
-    bill_amount = calc["bill_amount"]
-    link, rzp_link_id = await RazorpayAdapter.create_payment_link_full(
-        bill_amount, booking_id, cust.get("phone") or "",
-        notes={"type": "service_booking", "booking_id": booking_id}
-    )
-    upd = {"status": "BILLED",
-           "rzp_payment_link_id": rzp_link_id,
-           "bill_amount": bill_amount,
-           "subtotal": calc["subtotal"],
-           "discount": calc["discount"],
-           "discount_pct": calc["discount_pct"],
-           "loyalty_discount": calc["loyalty_discount"],
-           "extra_discount": calc["extra_discount"],
-           "loyalty_tier": calc["loyalty_tier"],
-           "payment_link": link, "billed_at": now_iso(),
-           "billed_by": user["id"]}
-    await db.bookings.update_one({"id": booking_id}, {"$set": upd})
-    b.update(upd)
-    recipients = await get_recipients_for_booking(b)
-    await publish_event("BILLED", b, recipients,
-                        extra={"bill_amount": bill_amount, "payment_link": link})
-    # Also send payment link via SMS (not just WhatsApp) so customer receives it either way
-    if cust.get("phone") and link:
-        sms_body = (
-            f"MacJit: Your bill of \u20B9{bill_amount:.0f} for {b.get('plate_number','')} is ready.\n"
-            f"Pay securely: {link}"
-        )
-        await TwilioAdapter.send_sms(cust["phone"], sms_body)
-    return b
 
+    pricing = await db.services.find_one(
+        {"key": b.get("service_type")},
+        {"_id": 0}
+    )
+
+    calc = _calculate_bill(
+        b,
+        pricing,
+        {"loyalty_tier": b.get("loyalty_tier", "BRONZE")}
+    )
+
+bill_amount = calc["bill_amount"]
+
+    try:
+        link, rzp_id = await RazorpayAdapter.create_payment_link_full(
+            bill_amount,
+            booking_id,
+            b.get("customer_phone"),
+            notes={"booking_id": booking_id}
+        )
+    except Exception as e:
+        raise HTTPException(500, f"Payment failed: {str(e)}")
+
+    await db.bookings.update_one(
+        {"id": booking_id},
+        {"$set": {
+            "payment_link": link,
+            "rzp_payment_link_id": rzp_id,
+            "status": "BILLED",
+            "billed_at": now_iso()
+        }}
+    )
+
+    return {
+        "payment_link": link,
+        "status": "BILLED"
+    }
 
 @api.post("/razorpay/webhook")
 async def razorpay_webhook(request: Request):
