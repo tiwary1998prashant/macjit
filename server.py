@@ -1254,9 +1254,20 @@ async def bill(booking_id: str, data: Optional[dict] = None,
     if not b:
         raise HTTPException(404, "Not found")
 
-    bill_amount = float(b.get("bill_amount") or 0)
-    if bill_amount <= 0:
-        raise HTTPException(400, "Invalid bill amount")
+    # ✅ Get pricing
+    pricing = await db.services.find_one(
+        {"key": b.get("service_type")},
+        {"_id": 0}
+    )
+
+    # ✅ Calculate bill
+    calc = _calculate_bill(
+        b,
+        pricing,
+        {"loyalty_tier": b.get("loyalty_tier", "BRONZE")}
+    )
+
+    bill_amount = calc["bill_amount"]   # ✅ INSIDE function
 
     try:
         link, rzp_id = await RazorpayAdapter.create_payment_link_full(
@@ -1271,6 +1282,7 @@ async def bill(booking_id: str, data: Optional[dict] = None,
     await db.bookings.update_one(
         {"id": booking_id},
         {"$set": {
+            "bill_amount": bill_amount,   # ✅ also store it
             "payment_link": link,
             "rzp_payment_link_id": rzp_id,
             "status": "BILLED",
@@ -1280,8 +1292,10 @@ async def bill(booking_id: str, data: Optional[dict] = None,
 
     return {
         "payment_link": link,
-        "status": "BILLED"
+        "status": "BILLED",
+        "amount": bill_amount   # optional but useful
     }
+               
 
 
 
