@@ -27,7 +27,9 @@ class Config:
     DB_NAME: str = os.environ.get('DB_NAME', '').strip().strip('"').strip("'")
 
     # Security
-    JWT_SECRET: str = os.environ.get('JWT_SECRET', 'macjit-dev-secret-change-in-prod')
+    JWT_SECRET: str = os.environ.get('JWT_SECRET')
+    if not JWT_SECRET:
+        raise ValueError("JWT_SECRET environment variable must be set")
     JWT_ALG: str = "HS256"
     ENCRYPTION_KEY: str = os.environ.get("ENCRYPTION_KEY", "")
 
