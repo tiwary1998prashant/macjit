@@ -89,6 +89,53 @@ body {
     pointer-events: none;
 }
 
+/* Landing page micro-interactions */
+.interactive-lift {
+    transition: transform 220ms ease, box-shadow 220ms ease, filter 220ms ease;
+    will-change: transform;
+}
+.interactive-lift:hover {
+    transform: translateY(-2px);
+    filter: brightness(1.02);
+}
+
+.hover-soft {
+    transition: transform 220ms ease, border-color 220ms ease, box-shadow 220ms ease, background-color 220ms ease;
+    will-change: transform;
+}
+.hover-soft:hover {
+    transform: translateY(-3px);
+    border-color: rgba(249, 115, 22, 0.35);
+    box-shadow: 0 14px 30px rgba(0, 0, 0, 0.28);
+}
+
+.reveal-up {
+    animation: reveal-up 520ms ease both;
+}
+.reveal-delay-1 { animation-delay: 80ms; }
+.reveal-delay-2 { animation-delay: 140ms; }
+
+@keyframes reveal-up {
+    from {
+        opacity: 0;
+        transform: translateY(10px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .interactive-lift,
+    .hover-soft,
+    .reveal-up {
+        transition: none !important;
+        animation: none !important;
+        transform: none !important;
+    }
+}
+
 /* Custom scrollbar */
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-track { background: #09090B; }

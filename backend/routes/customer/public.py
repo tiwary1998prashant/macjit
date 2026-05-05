@@ -5,6 +5,9 @@ from server import HTTPException, Optional, TwilioAdapter, db, encrypt_field, ge
 from utils.phone import _normalize_phone
 
 from fastapi import APIRouter
+import json
+import re
+import httpx
 router = APIRouter()
 # Auto-generated from routes.py section
 # Section starts at line 703
@@ -21,6 +24,19 @@ class CustomerBookingIn(BaseModel):
     service_type: str = "general"
     problem: str = ""
     preferred_slot: Optional[str] = None
+
+
+class TorqueChatIn(BaseModel):
+    message: str
+    history: list[dict] = []
+    stage: str = "problem"
+    details: dict = {}
+
+
+class TorqueChatOut(BaseModel):
+    reply: str
+    next_stage: str
+    field_updates: dict = {}
 
 
 def _plate(value: str) -> str:
@@ -143,6 +159,101 @@ async def _make_public_booking(data: CustomerBookingIn, source: str = "chatbot",
     except Exception:
         pass
     return {"booking": public_booking(booking), "track_url": track_url}
+
+
+def _extract_json_object(text: str) -> dict:
+    if not text:
+        return {}
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not m:
+        return {}
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return {}
+
+
+@router.post("/public/torque-chat", response_model=TorqueChatOut)
+async def torque_chat(data: TorqueChatIn):
+    api_key = (os.environ.get("GROQ_API_KEY") or "").strip()
+    msg = (data.message or "").strip()
+    if not msg:
+        raise HTTPException(400, "Message is required")
+
+    if not api_key:
+        # Graceful fallback if key is missing
+        return TorqueChatOut(
+            reply="I am ready to help with your bike. Please share your issue first (noise, brake, chain, starting, oil, etc.).",
+            next_stage=data.stage or "problem",
+            field_updates={},
+        )
+
+    safe_history = (data.history or [])[-12:]
+    system_prompt = (
+        "You are Torque, a friendly Indian bike mechanic assistant for MacJit garage.\n"
+        "Speak naturally like a real mechanic, concise and helpful.\n"
+        "You must support dynamic corrections anytime (name/phone/plate/model/problem).\n"
+        "Ask practical diagnosis questions before booking:\n"
+        "1) shown to another mechanic? what feedback\n"
+        "2) since how long issue exists\n"
+        "3) what customer self-tested\n"
+        "Then collect name, phone, bike number plate, bike model, and move to slot stage.\n"
+        "If user asks to update a field mid-conversation, update it and continue.\n"
+        "Indian bike plate examples: KA-05-MN-2024, 21 BH 1234 AA.\n"
+        "Return ONLY JSON with keys:\n"
+        "{"
+        "\"reply\": string, "
+        "\"next_stage\": one of [\"problem\",\"mechanic_feedback\",\"duration\",\"self_test\",\"name\",\"phone\",\"plate\",\"model\",\"slot\",\"done\"], "
+        "\"field_updates\": object"
+        "}\n"
+        "field_updates can include: customer_name, customer_phone, plate_number, car_model, problem, service_type.\n"
+        "Do not include markdown."
+    )
+
+    messages = [{"role": "system", "content": system_prompt}]
+    for h in safe_history:
+        role = "assistant" if h.get("from") == "bot" else "user"
+        content = (h.get("text") or "").strip()
+        if content:
+            messages.append({"role": role, "content": content})
+    context_blob = json.dumps(
+        {"stage": data.stage, "details": data.details},
+        ensure_ascii=True,
+    )
+    messages.append({"role": "user", "content": f"Context: {context_blob}\nUser message: {msg}"})
+
+    try:
+        async with httpx.AsyncClient(timeout=25) as cli:
+            resp = await cli.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "model": "llama-3.3-70b-versatile",
+                    "temperature": 0.4,
+                    "messages": messages,
+                },
+            )
+        if resp.status_code >= 400:
+            raise HTTPException(502, f"Groq error: {resp.text[:180]}")
+        content = (resp.json().get("choices") or [{}])[0].get("message", {}).get("content", "")
+        parsed = _extract_json_object(content)
+        reply = (parsed.get("reply") or "").strip() or "Please share a bit more detail so I can guide you correctly."
+        next_stage = (parsed.get("next_stage") or data.stage or "problem").strip()
+        field_updates = parsed.get("field_updates") if isinstance(parsed.get("field_updates"), dict) else {}
+        return TorqueChatOut(reply=reply, next_stage=next_stage, field_updates=field_updates)
+    except HTTPException:
+        raise
+    except Exception:
+        return TorqueChatOut(
+            reply="I could not process that fully. Please tell me your bike issue again and I will continue from there.",
+            next_stage=data.stage or "problem",
+            field_updates={},
+        )
 
 
 @router.post("/public/bookings")

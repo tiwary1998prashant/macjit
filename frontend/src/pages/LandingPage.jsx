@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { Wrench, Zap, Radio, Clock, ShieldCheck, ShoppingCart, ArrowRight, Phone, MapPin, Sparkles, Mail, Send, X } from "lucide-react";
 import MacJitLogo from "../components/MacJitLogo";
@@ -24,6 +24,11 @@ const STEPS = [
   { n: "04", t: "Approve & Pay", d: "Approve heavy work in one tap. Pay via UPI / cash. Done." },
 ];
 
+const INITIAL_TORQUE_MESSAGE = {
+  from: "bot",
+  text: "Hi, I am Torque from MacJit. Tell me what your bike is doing - unusual noise, brake issue, oil service, chain problem, anything. I will help like your workshop mechanic.",
+};
+
 export default function LandingPage() {
   const nav = useNavigate();
   const { user } = useAuth();
@@ -42,7 +47,7 @@ export default function LandingPage() {
       </div>
 
       {/* Nav */}
-      <nav className="sticky top-0 z-30 bg-zinc-950/80 backdrop-blur-xl border-b border-zinc-900">
+      <nav className="sticky top-0 z-30 bg-zinc-950/85 backdrop-blur-xl border-b border-zinc-900">
         <div className="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <MacJitLogo size={36} />
@@ -59,7 +64,7 @@ export default function LandingPage() {
             <a href="#contact" className="hover:text-orange-500">Contact</a>
           </div>
           <div className="flex items-center gap-2">
-            <button data-testid="nav-track" onClick={goTrack} className="bg-orange-500 hover:bg-orange-400 text-black font-display font-black uppercase tracking-widest px-4 py-2 transition-colors flex items-center gap-2">
+            <button data-testid="nav-track" onClick={goTrack} className="bg-orange-500 hover:bg-orange-400 text-black font-display font-black uppercase tracking-[0.16em] text-xs sm:text-sm px-3.5 sm:px-4 py-2.5 transition-colors flex items-center gap-2 shadow-[0_8px_30px_rgba(249,115,22,0.22)]">
               {user ? "Dashboard" : "Track Bike"} <ArrowRight className="w-3 h-3" />
             </button>
           </div>
@@ -67,22 +72,23 @@ export default function LandingPage() {
       </nav>
 
       {/* Hero */}
-      <section className="relative grid-bg overflow-hidden">
+      <section className="relative grid-bg overflow-hidden reveal-up">
+        <div className="absolute inset-0 bg-[radial-gradient(circle_at_20%_20%,rgba(249,115,22,0.18),transparent_35%),radial-gradient(circle_at_80%_0%,rgba(251,146,60,0.14),transparent_30%)] pointer-events-none" />
         <div className="absolute inset-0 bg-gradient-to-b from-transparent via-transparent to-zinc-950 pointer-events-none" />
-        <div className="max-w-7xl mx-auto px-6 py-20 lg:py-28 grid lg:grid-cols-12 gap-8 items-end relative">
+        <div className="max-w-7xl mx-auto px-6 py-16 sm:py-20 lg:py-28 grid lg:grid-cols-12 gap-8 items-end relative">
           <div className="lg:col-span-7">
             <div className="inline-flex items-center gap-2 border border-orange-500/40 bg-orange-500/5 px-3 py-1.5 mb-8">
               <span className="w-1.5 h-1.5 bg-orange-500 rounded-full animate-live-pulse" />
               <p className="font-mono text-[10px] uppercase tracking-[0.3em] text-orange-500">LIVE — 3 BAYS RUNNING</p>
             </div>
-            <h1 className="font-display font-black text-6xl sm:text-7xl lg:text-8xl tracking-tighter leading-[0.9] uppercase">
+            <h1 className="font-display font-black text-5xl sm:text-7xl lg:text-8xl tracking-tighter leading-[0.92] uppercase">
               Precision<br /><span className="text-orange-500">bike care</span><br />without waiting.
             </h1>
-            <p className="mt-8 text-zinc-400 font-mono text-base max-w-xl leading-relaxed">
+            <p className="mt-6 sm:mt-8 text-zinc-300 font-mono text-sm sm:text-base max-w-xl leading-relaxed">
               Book with Torque, drop your bike before the slot, and follow every stage from your phone. Cleaner booking, sharper workshop flow, no guessing.
             </p>
             <div className="mt-10 flex flex-wrap items-center gap-4">
-              <button data-testid="hero-book" onClick={() => setChatOpen(true)} className="bg-orange-500 hover:bg-orange-400 text-black font-display font-black uppercase tracking-widest px-7 py-4 transition-colors flex items-center gap-2 border-b-4 border-orange-700 active:translate-y-1 active:border-b-0">
+              <button data-testid="hero-book" onClick={() => setChatOpen(true)} className="interactive-lift bg-orange-500 hover:bg-orange-400 text-black font-display font-black uppercase tracking-[0.16em] text-xs sm:text-sm px-6 sm:px-7 py-3.5 sm:py-4 transition-colors flex items-center gap-2 border-b-4 border-orange-700 active:translate-y-1 active:border-b-0 shadow-[0_14px_40px_rgba(249,115,22,0.26)]">
                 Book with Torque <ArrowRight className="w-4 h-4" />
               </button>
               <button onClick={goTrack} className="font-mono text-[11px] uppercase tracking-[0.2em] text-zinc-300 hover:text-orange-500 underline underline-offset-8 decoration-orange-500">Track bike</button>
@@ -94,7 +100,7 @@ export default function LandingPage() {
             </div>
           </div>
           <div className="lg:col-span-5">
-            <div className="relative">
+            <div className="relative rounded-sm overflow-hidden border border-zinc-800 shadow-[0_20px_60px_rgba(0,0,0,0.5)]">
               <img
                 src="https://images.unsplash.com/photo-1558618666-fcd25c85cd64?auto=format&fit=crop&w=1200&q=80"
                 alt="Bike Workshop"
@@ -106,7 +112,7 @@ export default function LandingPage() {
                 <span className="w-2 h-2 bg-orange-500 rounded-full animate-live-pulse" />
                 <span className="font-mono text-[10px] uppercase tracking-[0.2em] text-white font-bold">BAY-01 LIVE</span>
               </div>
-              <div className="absolute -bottom-6 -left-6 bg-orange-500 text-black p-5 max-w-[60%]">
+              <div className="absolute -bottom-6 -left-1 sm:-left-6 bg-orange-500 text-black p-4 sm:p-5 max-w-[72%] sm:max-w-[60%]">
                 <p className="font-mono text-[10px] uppercase tracking-[0.2em]">Currently servicing</p>
                 <p className="font-display font-black text-2xl tracking-tighter mt-1">KA-05-MN-2024</p>
                 <p className="font-mono text-[10px] mt-1">Royal Enfield Classic 350 · 47% done</p>
@@ -117,7 +123,7 @@ export default function LandingPage() {
       </section>
 
       {/* Stats strip */}
-      <section className="border-y border-zinc-900 bg-zinc-950">
+      <section className="border-y border-zinc-900 bg-zinc-950 reveal-up reveal-delay-1">
         <div className="max-w-7xl mx-auto grid grid-cols-2 md:grid-cols-4 gap-px bg-zinc-900">
           {[
             { n: "1,400+", l: "Bikes serviced" },
@@ -125,7 +131,7 @@ export default function LandingPage() {
             { n: "4.9★", l: "Rider rating" },
             { n: "8AM–6PM", l: "Open daily" },
           ].map((s) => (
-            <div key={s.l} className="bg-zinc-950 p-8">
+            <div key={s.l} className="bg-zinc-950 p-6 sm:p-8 hover-soft">
               <p className="font-display font-black text-4xl text-orange-500 tracking-tighter">{s.n}</p>
               <p className="font-mono text-[10px] uppercase tracking-[0.2em] text-zinc-500 mt-2">{s.l}</p>
             </div>
@@ -134,7 +140,7 @@ export default function LandingPage() {
       </section>
 
       {/* Services */}
-      <section id="services" className="max-w-7xl mx-auto px-6 py-20">
+      <section id="services" className="max-w-7xl mx-auto px-6 py-20 reveal-up reveal-delay-2">
         <div className="grid lg:grid-cols-12 gap-8 mb-12">
           <div className="lg:col-span-5">
             <p className="font-mono text-[10px] uppercase tracking-[0.3em] text-orange-500 mb-2">01 — Services</p>
@@ -146,7 +152,7 @@ export default function LandingPage() {
         </div>
         <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-px bg-zinc-900">
           {SERVICES.map((s, i) => (
-            <div key={s.name} data-testid={`service-${s.name.toLowerCase().replace(/ /g, '-')}`} className="bg-zinc-950 p-7 hover:bg-orange-500/5 group transition-colors">
+            <div key={s.name} data-testid={`service-${s.name.toLowerCase().replace(/ /g, '-')}`} className="bg-zinc-950 p-7 hover:bg-orange-500/5 group transition-colors hover-soft">
               <div className="flex items-start justify-between mb-6">
                 <span className="font-mono text-[10px] uppercase tracking-[0.3em] text-zinc-500">/{(i + 1).toString().padStart(2, "0")}</span>
                 <span className="bg-zinc-900 text-orange-500 font-mono text-[10px] uppercase tracking-widest px-2 py-1"><Clock className="w-3 h-3 inline mr-1" />{s.duration}</span>
@@ -156,26 +162,26 @@ export default function LandingPage() {
               <p className="font-display font-black text-4xl tracking-tighter">₹{s.price}<span className="text-zinc-600 text-sm font-mono ml-2">starting</span></p>
             </div>
           ))}
-          <div className="bg-orange-500 text-black p-7 flex flex-col justify-between">
+          <div className="bg-gradient-to-br from-orange-500 to-orange-400 text-black p-7 flex flex-col justify-between">
             <div>
               <Sparkles className="w-7 h-7 mb-4" />
               <h3 className="font-display font-black text-2xl tracking-tight mb-2">Loyalty rewards</h3>
               <p className="text-sm mb-2">Spend ₹10k → SILVER (5% off)</p>
               <p className="text-sm">Spend ₹25k → GOLD (10% off)</p>
             </div>
-              <button onClick={() => setChatOpen(true)} className="mt-6 bg-black text-orange-500 font-display font-black uppercase tracking-widest py-3 self-start px-5 hover:bg-zinc-900 transition-colors flex items-center gap-2">Book now <ArrowRight className="w-3 h-3" /></button>
+              <button onClick={() => setChatOpen(true)} className="interactive-lift mt-6 bg-black text-orange-500 font-display font-black uppercase tracking-widest py-3 self-start px-5 hover:bg-zinc-900 transition-colors flex items-center gap-2 shadow-lg">Book now <ArrowRight className="w-3 h-3" /></button>
           </div>
         </div>
       </section>
 
       {/* How it works */}
-      <section id="how" className="bg-zinc-900/40 border-y border-zinc-900">
+      <section id="how" className="bg-zinc-900/40 border-y border-zinc-900 reveal-up">
         <div className="max-w-7xl mx-auto px-6 py-20">
           <p className="font-mono text-[10px] uppercase tracking-[0.3em] text-orange-500 mb-2">02 — Process</p>
           <h2 className="font-display font-black text-5xl lg:text-6xl tracking-tighter uppercase mb-16">From keys in<br />to keys back.</h2>
           <div className="grid md:grid-cols-2 lg:grid-cols-4 gap-px bg-zinc-800">
             {STEPS.map((s) => (
-              <div key={s.n} className="bg-zinc-950 p-8 relative overflow-hidden">
+              <div key={s.n} className="bg-zinc-950 p-8 relative overflow-hidden hover-soft">
                 <span className="font-display font-black text-[120px] leading-none tracking-tighter text-orange-500/10 absolute -top-4 -right-2 select-none">{s.n}</span>
                 <p className="font-mono text-[10px] uppercase tracking-[0.3em] text-orange-500 relative">Step {s.n}</p>
                 <h3 className="font-display font-black text-2xl tracking-tight mt-3 relative">{s.t}</h3>
@@ -187,25 +193,25 @@ export default function LandingPage() {
       </section>
 
       {/* Shop teaser */}
-      <section id="shop" className="max-w-7xl mx-auto px-6 py-20 grid lg:grid-cols-2 gap-12 items-center">
+      <section id="shop" className="max-w-7xl mx-auto px-6 py-20 grid lg:grid-cols-2 gap-12 items-center reveal-up reveal-delay-1">
         <div>
           <p className="font-mono text-[10px] uppercase tracking-[0.3em] text-orange-500 mb-2">03 — Shop</p>
           <h2 className="font-display font-black text-5xl lg:text-6xl tracking-tighter uppercase">Parts &<br />accessories.</h2>
           <p className="text-zinc-400 font-mono text-sm mt-6 max-w-md">
             Walk-in counter for genuine engine oil, brake shoes, filters, tyres, chains and lubricants. Same stock the workshop uses. Cash or UPI.
           </p>
-          <button onClick={goTrack} className="mt-8 border border-orange-500 text-orange-500 hover:bg-orange-500 hover:text-black font-display font-black uppercase tracking-widest px-6 py-3 transition-colors flex items-center gap-2">
+          <button onClick={goTrack} className="interactive-lift mt-8 border border-orange-500 text-orange-500 hover:bg-orange-500 hover:text-black font-display font-black uppercase tracking-widest px-6 py-3 transition-colors flex items-center gap-2">
             <ShoppingCart className="w-4 h-4" /> Browse parts
           </button>
         </div>
-        <div className="grid grid-cols-2 gap-px bg-zinc-900">
+        <div className="grid grid-cols-2 gap-px bg-zinc-900 border border-zinc-800">
           {[
             { n: "Engine Oil 1L", p: 350, c: "Motul" },
             { n: "Brake Shoe Set", p: 420, c: "OEM" },
             { n: "Air Filter", p: 280, c: "Genuine" },
             { n: "Spark Plug", p: 150, c: "NGK" },
           ].map((it) => (
-            <div key={it.n} className="bg-zinc-950 p-5">
+            <div key={it.n} className="bg-zinc-950 p-5 hover-soft">
               <p className="font-mono text-[10px] uppercase tracking-widest text-zinc-500">{it.c}</p>
               <p className="font-display font-bold mt-1">{it.n}</p>
               <p className="font-display font-black text-2xl text-orange-500 mt-3">₹{it.p}</p>
@@ -215,7 +221,7 @@ export default function LandingPage() {
       </section>
 
       {/* Testimonial */}
-      <section className="bg-orange-500 text-black">
+      <section className="bg-orange-500 text-black reveal-up">
         <div className="max-w-5xl mx-auto px-6 py-20">
           <p className="font-mono text-[10px] uppercase tracking-[0.3em] mb-6">/ what riders say</p>
           <p className="font-display font-black text-3xl lg:text-5xl tracking-tighter leading-tight">
@@ -232,7 +238,7 @@ export default function LandingPage() {
       </section>
 
       {/* Enquiry */}
-      <section id="enquiry" className="max-w-7xl mx-auto px-6 py-24">
+      <section id="enquiry" className="max-w-7xl mx-auto px-6 py-24 reveal-up reveal-delay-1">
         <div className="grid lg:grid-cols-12 gap-10">
           <div className="lg:col-span-5">
             <p className="font-mono text-[10px] uppercase tracking-[0.3em] text-orange-500 mb-2">/ Talk to us</p>
@@ -260,28 +266,44 @@ export default function LandingPage() {
       </section>
 
       {/* CTA */}
-      <section className="max-w-7xl mx-auto px-6 py-24 text-center">
+      <section className="max-w-7xl mx-auto px-6 py-20 sm:py-24 text-center reveal-up">
         <h2 className="font-display font-black text-6xl lg:text-8xl tracking-tighter uppercase">Ready when<br /><span className="text-orange-500">you are.</span></h2>
-        <button onClick={() => setChatOpen(true)} className="mt-10 bg-orange-500 hover:bg-orange-400 text-black font-display font-black uppercase tracking-widest px-8 py-5 text-lg transition-colors inline-flex items-center gap-2 border-b-4 border-orange-700 active:translate-y-1 active:border-b-0">
+        <button onClick={() => setChatOpen(true)} className="interactive-lift mt-10 bg-orange-500 hover:bg-orange-400 text-black font-display font-black uppercase tracking-widest px-7 sm:px-8 py-4 sm:py-5 text-base sm:text-lg transition-colors inline-flex items-center gap-2 border-b-4 border-orange-700 active:translate-y-1 active:border-b-0 shadow-[0_16px_44px_rgba(249,115,22,0.26)]">
           Ask Torque <ArrowRight className="w-5 h-5" />
         </button>
       </section>
 
       <ServiceChatbot open={chatOpen} setOpen={setChatOpen} />
 
-      {/* Bike Repair Video */}
-      <section className="max-w-7xl mx-auto px-6 pb-20">
+      {/* Workshop gallery */}
+      <section className="max-w-7xl mx-auto px-6 pb-20 reveal-up reveal-delay-2">
         <div className="grid lg:grid-cols-12 gap-8 mb-8">
           <div className="lg:col-span-5">
-            <p className="font-mono text-[10px] uppercase tracking-[0.3em] text-orange-500 mb-2">04 — Inside the workshop</p>
-            <h2 className="font-display font-black text-4xl lg:text-5xl tracking-tighter uppercase">See how we<br />treat your bike.</h2>
+            <p className="font-mono text-[10px] uppercase tracking-[0.3em] text-orange-500 mb-2">04 — Workshop moments</p>
+            <h2 className="font-display font-black text-4xl lg:text-5xl tracking-tighter uppercase">Real garage.<br />Real care.</h2>
           </div>
           <p className="lg:col-span-6 lg:col-start-7 text-zinc-400 font-mono text-sm self-end">
-            Every bike gets the same thorough treatment — cleaned, inspected, and road-tested before it leaves our bay.
+            From diagnostics to final road test, every bike is handled with a consistent quality checklist and mechanic-level attention.
           </p>
         </div>
-        <VideoPlayer />
-        <div className="mt-4 flex items-center gap-6 font-mono text-[10px] uppercase tracking-[0.2em] text-zinc-600">
+        <div className="grid md:grid-cols-3 gap-4">
+          {[
+            "https://images.unsplash.com/photo-1625047509168-a7026f36de04?auto=format&fit=crop&w=1200&q=80",
+            "https://images.unsplash.com/photo-1558981806-ec527fa84c39?auto=format&fit=crop&w=1200&q=80",
+            "https://images.unsplash.com/photo-1580310614729-ccd69652491d?auto=format&fit=crop&w=1200&q=80",
+          ].map((img, idx) => (
+            <div key={img} className="relative overflow-hidden border border-zinc-800 bg-zinc-900 group rounded-sm">
+              <img
+                src={img}
+                alt={`MacJit workshop scene ${idx + 1}`}
+                className="h-64 w-full object-cover group-hover:scale-105 transition-transform duration-500"
+                onError={(e) => { e.currentTarget.src = "https://images.unsplash.com/photo-1609630875171-b1321377ee65?auto=format&fit=crop&w=1200&q=80"; }}
+              />
+              <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-black/20 to-transparent" />
+            </div>
+          ))}
+        </div>
+        <div className="mt-4 flex flex-wrap items-center gap-4 sm:gap-6 font-mono text-[10px] uppercase tracking-[0.2em] text-zinc-600">
           <span className="flex items-center gap-2"><ShieldCheck className="w-3 h-3 text-orange-500" />Trained technicians only</span>
           <span className="flex items-center gap-2"><Wrench className="w-3 h-3 text-orange-500" />Genuine & OEM parts</span>
           <span className="flex items-center gap-2"><Zap className="w-3 h-3 text-orange-500" />Road-tested before delivery</span>
@@ -332,56 +354,14 @@ export default function LandingPage() {
   );
 }
 
-function VideoPlayer() {
-  const [playing, setPlaying] = useState(false);
-  return (
-    <div className="relative w-full bg-zinc-900 border border-zinc-800 overflow-hidden" style={{ paddingBottom: "42%", minHeight: "220px" }}>
-      {playing ? (
-        <iframe
-          className="absolute inset-0 w-full h-full"
-          src="https://www.youtube.com/embed/ebV7S_6_qUM?autoplay=1&rel=0&modestbranding=1&controls=1"
-          title="Bike Service & Repair — MacJit Workshop"
-          frameBorder="0"
-          allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-          allowFullScreen
-        />
-      ) : (
-        <button
-          onClick={() => setPlaying(true)}
-          className="absolute inset-0 w-full h-full group focus:outline-none"
-          aria-label="Play bike repair video"
-        >
-          <img
-            src="https://images.unsplash.com/photo-1568772585407-9361f9bf3a87?auto=format&fit=crop&w=1400&q=80"
-            alt="Bike repair workshop"
-            className="w-full h-full object-cover"
-            onError={(e) => { e.currentTarget.src = "https://images.unsplash.com/photo-1609630875171-b1321377ee65?auto=format&fit=crop&w=1400&q=80"; }}
-          />
-          <div className="absolute inset-0 bg-black/50 group-hover:bg-black/40 transition-colors" />
-          <div className="absolute inset-0 flex flex-col items-center justify-center gap-4">
-            <div className="w-16 h-16 rounded-full bg-orange-500 group-hover:bg-orange-400 flex items-center justify-center transition-colors shadow-2xl">
-              <svg className="w-7 h-7 text-black ml-1" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
-            </div>
-            <span className="font-mono text-[11px] uppercase tracking-[0.3em] text-white/80">Watch — Inside the workshop</span>
-          </div>
-          <div className="absolute top-4 left-4 flex items-center gap-2 bg-black/70 backdrop-blur px-3 py-1.5">
-            <span className="w-2 h-2 bg-orange-500 rounded-full" />
-            <span className="font-mono text-[10px] uppercase tracking-[0.2em] text-white font-bold">Workshop Tour</span>
-          </div>
-        </button>
-      )}
-    </div>
-  );
-}
-
 function ServiceChatbot({ open, setOpen }) {
   const nav = useNavigate();
+  const chatScrollRef = useRef(null);
   const [busy, setBusy] = useState(false);
   const [input, setInput] = useState("");
   const [stage, setStage] = useState("problem");
-  const [messages, setMessages] = useState([
-    { from: "bot", text: "Hi, I am Torque. Tell me what is happening with your bike, like engine noise, brake loose, oil change, chain issue, or anything else." },
-  ]);
+  const [pendingEditField, setPendingEditField] = useState("");
+  const [messages, setMessages] = useState([INITIAL_TORQUE_MESSAGE]);
   const [details, setDetails] = useState({
     customer_name: "",
     customer_phone: "",
@@ -391,7 +371,42 @@ function ServiceChatbot({ open, setOpen }) {
     service_type: "",
     known_service: false,
     preferred_slot: "",
+    diagnosis_notes: {
+      mechanic_feedback: "",
+      duration: "",
+      self_test: "",
+    },
   });
+
+  const resetChat = useCallback(() => {
+    setBusy(false);
+    setInput("");
+    setStage("problem");
+    setMessages([INITIAL_TORQUE_MESSAGE]);
+    setDetails({
+      customer_name: "",
+      customer_phone: "",
+      plate_number: "",
+      car_model: "",
+      problem: "",
+      service_type: "",
+      known_service: false,
+      preferred_slot: "",
+      diagnosis_notes: {
+        mechanic_feedback: "",
+        duration: "",
+        self_test: "",
+      },
+    });
+    setPendingEditField("");
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    const node = chatScrollRef.current;
+    if (!node) return;
+    node.scrollTop = node.scrollHeight;
+  }, [messages, open, stage]);
 
   const formatPhone = (value) => {
     const trimmed = value.trim();
@@ -401,6 +416,36 @@ function ServiceChatbot({ open, setOpen }) {
     if (!digits) return "";
     if (digits.startsWith("91") && digits.length > 10) return `+${digits.slice(0, 12)}`;
     return `+91${digits.slice(0, 10)}`;
+  };
+
+  const isGreeting = useCallback((text) => {
+    const normalized = (text || "").toLowerCase().trim();
+    if (!normalized) return false;
+    const greetingWords = ["hi", "hello", "hey", "hii", "good morning", "good afternoon", "good evening", "namaste"];
+    return greetingWords.some((word) => normalized === word || normalized.startsWith(`${word} `));
+  }, []);
+
+  const askingBikeNumber = useCallback((text) => {
+    const normalized = (text || "").toLowerCase();
+    return /bike number|vehicle number|plate number|registration number|rc number|number plate/.test(normalized);
+  }, []);
+
+  const normalizePlate = (value) => value.toUpperCase().replace(/[\s-]+/g, "");
+
+  const isValidIndianBikeNumber = useCallback((plate) => {
+    const normalized = normalizePlate(plate);
+    const standardPattern = /^[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{4}$/;
+    const bhPattern = /^\d{2}BH\d{4}[A-Z]{1,2}$/;
+    return standardPattern.test(normalized) || bhPattern.test(normalized);
+  }, []);
+
+  const formatPlateForDisplay = (plate) => {
+    const normalized = normalizePlate(plate);
+    const bhMatch = normalized.match(/^(\d{2})(BH)(\d{4})([A-Z]{1,2})$/);
+    if (bhMatch) return `${bhMatch[1]} ${bhMatch[2]} ${bhMatch[3]} ${bhMatch[4]}`;
+    const standardMatch = normalized.match(/^([A-Z]{2})(\d{1,2})([A-Z]{1,3})(\d{4})$/);
+    if (standardMatch) return `${standardMatch[1]}-${standardMatch[2]}-${standardMatch[3]}-${standardMatch[4]}`;
+    return normalized;
   };
 
   const detectService = useCallback((text) => {
@@ -413,6 +458,27 @@ function ServiceChatbot({ open, setOpen }) {
     if (p.includes("wheel") || p.includes("align") || p.includes("balance")) return "alignment";
     return "";
   }, []);
+
+  const detectEditField = useCallback((text) => {
+    const normalized = (text || "").toLowerCase();
+    const wantsUpdate = /wrong|update|change|correct|edit|mistake|typo/.test(normalized);
+    if (!wantsUpdate) return "";
+    if (/bike number|vehicle number|plate|registration|rc/.test(normalized)) return "plate_number";
+    if (/phone|mobile|contact/.test(normalized)) return "customer_phone";
+    if (/name/.test(normalized)) return "customer_name";
+    if (/model|bike model/.test(normalized)) return "car_model";
+    if (/issue|problem|noise|complaint/.test(normalized)) return "problem";
+    return "";
+  }, []);
+
+  const promptForField = (field) => {
+    if (field === "plate_number") return "No problem. Please send the correct bike number (example: KA-05-MN-2024).";
+    if (field === "customer_phone") return "Sure, please send the correct phone number.";
+    if (field === "customer_name") return "Sure, please send the correct name.";
+    if (field === "car_model") return "Sure, please send the correct bike model.";
+    if (field === "problem") return "Got it. Please tell me the correct issue in detail.";
+    return "Tell me what you want to update.";
+  };
 
   const nextSlots = useCallback(() => {
     const base = new Date();
@@ -434,7 +500,12 @@ function ServiceChatbot({ open, setOpen }) {
     setBusy(true);
     try {
       const payload = {
-        ...details,
+        customer_name: details.customer_name,
+        customer_phone: details.customer_phone,
+        plate_number: details.plate_number,
+        problem: `${details.problem}\nMechanic feedback: ${details.diagnosis_notes.mechanic_feedback || "not shared"}\nDuration: ${details.diagnosis_notes.duration || "not shared"}\nSelf test: ${details.diagnosis_notes.self_test || "not shared"}`,
+        service_type: details.service_type || "diagnostic-check",
+        known_service: true,
         preferred_slot: slotIso,
         car_make: "Bike",
         car_model: details.car_model || "Bike",
@@ -451,73 +522,74 @@ function ServiceChatbot({ open, setOpen }) {
     }
   };
 
-  const submitEnquiry = async (nextDetails = details) => {
-    setBusy(true);
-    try {
-      await api.post("/enquiries", {
-        name: nextDetails.customer_name,
-        phone: nextDetails.customer_phone,
-        car_make: "Bike",
-        car_model: nextDetails.car_model,
-        service_interest: "admin-review",
-        message: `${nextDetails.problem}\nBike number: ${nextDetails.plate_number || "not provided"}`,
-      });
-      push("bot", "I do not have a ready service lane for this yet, so I sent it to admin enquiries. Admin can review the problem, create a service if needed, and book manually as per customer demand.");
-      setStage("done");
-      toast.success("Sent to admin enquiries");
-    } catch (err) {
-      toast.error(err.response?.data?.detail || "Could not send enquiry");
-    } finally {
-      setBusy(false);
-    }
-  };
-
   const handleSend = async (e) => {
     e?.preventDefault();
     const text = input.trim();
-    if (!text || busy || stage === "done" || stage === "slot") return;
+    if (!text || busy) return;
     setInput("");
     push("user", text);
 
-    if (stage === "problem") {
-      const service = detectService(text);
-      setDetails((d) => ({ ...d, problem: text, service_type: service, known_service: !!service }));
-      if (service) {
-        push("bot", `I can handle that under ${service.replace(/-/g, " ")}. What is your name?`);
+    if (pendingEditField) {
+      if (pendingEditField === "plate_number") {
+        if (!isValidIndianBikeNumber(text)) {
+          push("bot", "That still looks incorrect. Please send a valid bike number like KA-05-MN-2024 or 21 BH 1234 AA.");
+          return;
+        }
+        setDetails((d) => ({ ...d, plate_number: formatPlateForDisplay(text) }));
+      } else if (pendingEditField === "customer_phone") {
+        const phone = formatPhone(text);
+        if (!phone || phone.length < 10) {
+          push("bot", "Please send a valid phone number with country code or 10 digits.");
+          return;
+        }
+        setDetails((d) => ({ ...d, customer_phone: phone }));
       } else {
-        push("bot", "This sounds like it needs admin review before booking. I will send it to enquiries. What is your name?");
+        setDetails((d) => ({ ...d, [pendingEditField]: text }));
       }
-      setStage("name");
+      setPendingEditField("");
+      push("bot", "Done, I have updated it. Continue from where we stopped.");
       return;
     }
-    if (stage === "name") {
-      setDetails((d) => ({ ...d, customer_name: text }));
-      push("bot", "Share your phone number.");
-      setStage("phone");
+
+    const fieldToEdit = detectEditField(text);
+    if (fieldToEdit) {
+      setPendingEditField(fieldToEdit);
+      push("bot", promptForField(fieldToEdit));
       return;
     }
-    if (stage === "phone") {
-      const phone = formatPhone(text);
-      setDetails((d) => ({ ...d, customer_phone: phone }));
-      push("bot", "What is your bike number?");
-      setStage("plate");
-      return;
-    }
-    if (stage === "plate") {
-      setDetails((d) => ({ ...d, plate_number: text.toUpperCase() }));
-      push("bot", "Which bike model is it?");
-      setStage("model");
-      return;
-    }
-    if (stage === "model") {
-      const next = { ...details, car_model: text };
-      setDetails(next);
-      if (next.known_service) {
-        push("bot", "Pick a drop slot below.");
-        setStage("slot");
-      } else {
-        await submitEnquiry(next);
-      }
+
+    try {
+      const historyForAi = [...messages, { from: "user", text }];
+      const ai = await api.post("/public/torque-chat", {
+        message: text,
+        history: historyForAi,
+        stage,
+        details,
+      });
+      const payload = ai.data || {};
+      const updates = payload.field_updates || {};
+
+      setDetails((d) => {
+        const next = { ...d };
+        if (updates.customer_name) next.customer_name = String(updates.customer_name).trim();
+        if (updates.customer_phone) next.customer_phone = formatPhone(String(updates.customer_phone));
+        if (updates.plate_number) {
+          const rawPlate = String(updates.plate_number);
+          next.plate_number = isValidIndianBikeNumber(rawPlate) ? formatPlateForDisplay(rawPlate) : d.plate_number;
+        }
+        if (updates.car_model) next.car_model = String(updates.car_model).trim();
+        if (updates.problem) next.problem = String(updates.problem).trim();
+        if (updates.service_type) next.service_type = String(updates.service_type).trim();
+        if (next.problem && !next.service_type) next.service_type = detectService(next.problem) || "diagnostic-check";
+        if (next.service_type) next.known_service = true;
+        return next;
+      });
+
+      push("bot", payload.reply || "Tell me a bit more and I will guide you.");
+      const nextStage = payload.next_stage || stage;
+      setStage(nextStage);
+    } catch (err) {
+      push("bot", "I could not process that now. Please repeat in short, I will help.");
     }
   };
 
@@ -527,17 +599,20 @@ function ServiceChatbot({ open, setOpen }) {
     <>
       <button
         type="button"
-        onClick={() => setOpen(true)}
+        onClick={() => {
+          if (stage === "done") resetChat();
+          setOpen(true);
+        }}
         data-testid="macjit-chatbot-open"
-        className="fixed bottom-5 right-5 z-40 bg-orange-500 hover:bg-orange-400 text-black shadow-2xl border-b-4 border-orange-700 active:translate-y-1 active:border-b-0 px-5 py-4 flex items-center gap-3"
+        className="fixed bottom-5 right-5 z-40 bg-orange-500 hover:bg-orange-400 text-black shadow-2xl border-b-4 border-orange-700 active:translate-y-1 active:border-b-0 px-4 py-3 flex items-center gap-2.5"
       >
-        <Wrench className="w-5 h-5" />
-        <span className="font-display font-black uppercase tracking-widest text-sm">Ask Torque</span>
+        <Wrench className="w-4 h-4" />
+        <span className="font-display font-black uppercase tracking-[0.18em] text-xs">Ask Torque</span>
       </button>
 
       {open && (
         <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-end sm:items-center justify-center p-3" data-testid="macjit-chatbot">
-          <div className="w-full max-w-2xl bg-zinc-950 border border-orange-500/40 shadow-2xl max-h-[92vh] overflow-auto">
+          <div className="w-full max-w-xl bg-zinc-950 border border-orange-500/40 shadow-2xl h-[min(88vh,680px)] flex flex-col rounded-sm">
             <div className="sticky top-0 bg-zinc-950 border-b border-zinc-800 p-4 flex items-center justify-between">
               <div className="flex items-center gap-3">
                 <div className="w-10 h-10 bg-orange-500 text-black grid place-items-center">
@@ -548,16 +623,25 @@ function ServiceChatbot({ open, setOpen }) {
                   <p className="font-mono text-[10px] uppercase tracking-[0.2em] text-zinc-500">Problem reader / Slot booker</p>
                 </div>
               </div>
-              <button onClick={() => setOpen(false)} className="w-9 h-9 border border-zinc-800 grid place-items-center text-zinc-400 hover:text-orange-500">
-                <X className="w-4 h-4" />
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={resetChat}
+                  className="px-2.5 py-1 border border-zinc-800 text-[10px] font-mono uppercase tracking-wider text-zinc-300 hover:text-orange-500 hover:border-orange-500/40"
+                >
+                  New chat
+                </button>
+                <button onClick={() => setOpen(false)} className="w-9 h-9 border border-zinc-800 grid place-items-center text-zinc-400 hover:text-orange-500">
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
             </div>
 
-            <div className="p-4 h-[420px] overflow-y-auto space-y-3 bg-black">
+            <div ref={chatScrollRef} className="p-4 flex-1 min-h-0 overflow-y-auto space-y-3 bg-black">
               {messages.map((m, idx) => (
                 <div key={idx} className={`flex ${m.from === "user" ? "justify-end" : "justify-start"}`}>
-                  <div className={`max-w-[82%] px-4 py-3 text-sm ${m.from === "user" ? "bg-orange-500 text-black" : "bg-zinc-900 text-zinc-100 border border-zinc-800"}`}>
-                    <p className="font-mono whitespace-pre-wrap">{m.text}</p>
+                  <div className={`max-w-[85%] px-4 py-3 text-sm leading-relaxed ${m.from === "user" ? "bg-orange-500 text-black" : "bg-zinc-900 text-zinc-100 border border-zinc-800"}`}>
+                    <p className="font-mono whitespace-pre-wrap break-words">{m.text}</p>
                   </div>
                 </div>
               ))}
@@ -586,15 +670,15 @@ function ServiceChatbot({ open, setOpen }) {
                 </button>
               )}
             </div>
-            <form onSubmit={handleSend} className="border-t border-zinc-800 p-3 flex gap-2 bg-zinc-950">
+            <form onSubmit={handleSend} className="border-t border-zinc-800 p-3 flex gap-2 bg-zinc-950 shrink-0">
               <input
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
-                disabled={busy || stage === "slot" || stage === "done"}
-                placeholder={stage === "slot" ? "Pick a slot above" : stage === "done" ? "Conversation complete" : "Type your reply..."}
+                disabled={busy}
+                placeholder="Type your reply..."
                 className="flex-1 bg-black border border-zinc-800 px-3 py-3 font-mono text-sm text-white focus:border-orange-500 outline-none disabled:opacity-50"
               />
-              <button disabled={busy || stage === "slot" || stage === "done"} className="bg-orange-500 hover:bg-orange-400 text-black font-display font-black uppercase tracking-widest px-5 disabled:opacity-50">
+              <button disabled={busy} className="bg-orange-500 hover:bg-orange-400 text-black font-display font-black uppercase tracking-widest px-5 disabled:opacity-50">
                 Send
               </button>
             </form>
