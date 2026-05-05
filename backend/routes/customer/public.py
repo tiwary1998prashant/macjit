@@ -474,7 +474,14 @@ async def invoice_pdf(booking_id: str):
 
     # Line items
     rows = [["#", "Item / Service", "SKU", "Qty", "Rate (\u20B9)", "Amount (\u20B9)"]]
-    base_charge = b.get("subtotal", 0) - sum(i.get("subtotal", 0) for i in (b.get("items") or [])) - (b.get("extra_cost", 0) or 0)
+    items_total = sum(i.get("subtotal", 0) for i in (b.get("items") or []))
+    discount_total = b.get("discount", 0) or 0
+    subtotal = b.get("subtotal")
+    if subtotal is None:
+        subtotal = (b.get("bill_amount", 0) or 0) + discount_total
+    base_charge = b.get("base_charge")
+    if base_charge is None:
+        base_charge = subtotal - items_total - (b.get("extra_cost", 0) or 0)
     rows.append([
         "1",
         f"Service charge ({b.get('service_type','')})",
@@ -508,7 +515,7 @@ async def invoice_pdf(booking_id: str):
 
     # Totals
     tot_rows = [
-        ["Subtotal", f"\u20B9{b.get('subtotal', 0):.0f}"],
+        ["Subtotal", f"\u20B9{subtotal:.0f}"],
     ]
     if b.get("loyalty_discount"):
         tot_rows.append([f"Loyalty discount ({b.get('loyalty_tier','')} – {b.get('discount_pct',0)}%)",

@@ -284,7 +284,12 @@ async def finish(booking_id: str, user=Depends(require_roles("mechanic"))):
 async def qa_done(booking_id: str, user=Depends(require_roles("tester"))):
     upd = {"status": "QA_DONE", "qa_done_at": now_iso(),
            "tester_id": user["id"], "tester_name": user["name"],
-           "tester_phone": user.get("phone")}
+           "tester_phone": user.get("phone"),
+           "qa_fail_reasons": [],
+           "qa_fail_notes": "",
+           "qa_failed_at": None,
+           "qa_fail_tester_id": None,
+           "qa_fail_tester_name": None}
     await db.bookings.update_one({"id": booking_id}, {"$set": upd})
     b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
     recipients = await get_recipients_for_booking(b, include_tester=True)
@@ -313,14 +318,24 @@ async def qa_fail(booking_id: str, body: QAFailIn, user=Depends(require_roles("t
     b = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
     # Notify mechanic via in-app + SMS (not customer)
     recipients = await get_recipients_for_booking(b, include_tester=True, include_reception=True)
-    await publish_event("QA_FAIL", b, recipients)
+    await publish_event("QA_FAIL", b, recipients, extra={
+        "reasons": body.reasons,
+        "notes": body.notes or "",
+        "customer_name": b.get("customer_name_plain") or b.get("customer_name"),
+        "customer_phone": b.get("customer_phone"),
+        "mechanic_id": b.get("mechanic_id"),
+        "mechanic_name": b.get("mechanic_name"),
+        "bay_name": b.get("bay_name"),
+    })
     mechanic_phone = b.get("mechanic_phone") or ""
     if mechanic_phone:
         reasons_str = ", ".join(body.reasons)
-        msg = (f"MacJit QA FAILED: {b.get('plate_number')} — Reason(s): {reasons_str}. "
+        msg = (f"MacJit QA FAILED: {b.get('plate_number')} ({b.get('car_make','')} {b.get('car_model','')})\n"
+               f"Customer: {b.get('customer_name_plain') or b.get('customer_name','')} {b.get('customer_phone','')}\n"
+               f"Reason(s): {reasons_str}\n"
                f"Please fix and resubmit for QA.")
         if body.notes:
-            msg += f" Notes: {body.notes}"
+            msg += f"\nNotes: {body.notes}"
         await TwilioAdapter.send_sms(mechanic_phone, msg)
     return public_booking(b)
 
@@ -394,7 +409,7 @@ async def bill(booking_id: str, data: Optional[dict] = None,
         {"loyalty_tier": b.get("loyalty_tier", "BRONZE")}
     )
 
-    bill_amount = calc["bill_amount"]   # ✅ INSIDE function
+    bill_amount = calc["bill_amount"]
 
     try:
         link, rzp_id = await RazorpayAdapter.create_payment_link_full(
@@ -409,7 +424,7 @@ async def bill(booking_id: str, data: Optional[dict] = None,
     await db.bookings.update_one(
         {"id": booking_id},
         {"$set": {
-            "bill_amount": bill_amount,   # ✅ also store it
+            **calc,
             "payment_link": link,
             "rzp_payment_link_id": rzp_id,
             "status": "BILLED",
@@ -420,7 +435,8 @@ async def bill(booking_id: str, data: Optional[dict] = None,
     return {
         "payment_link": link,
         "status": "BILLED",
-        "amount": bill_amount   # optional but useful
+        "amount": bill_amount,
+        **calc,
     }
                
 
