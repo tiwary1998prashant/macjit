@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>MacJit — Logo Samples</title>
+<style>
+  :root { --navy:#1E2A44; --orange:#F26A21; --cream:#F5F3EF; --steel:#C7CAD1; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:#0B0F1A; color:#fff; font-family: 'Chivo', system-ui, -apple-system, sans-serif; padding:48px 32px; }
+  h1 { font-size: 32px; letter-spacing:-0.02em; margin:0 0 8px; }
+  .sub { color:#9aa3b2; font-family:'IBM Plex Mono', monospace; font-size:12px; letter-spacing:0.24em; text-transform:uppercase; margin-bottom:48px; }
+  .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap:24px; max-width:1400px; margin:0 auto; }
+  .card { background:#11182B; border:1px solid #1f2a44; padding:28px; display:flex; flex-direction:column; align-items:center; gap:20px; position:relative; overflow:hidden; }
+  .card::before { content:""; position:absolute; top:0; left:0; right:0; height:3px; background:var(--orange); }
+  .label { position:absolute; top:14px; right:14px; font-family:'IBM Plex Mono', monospace; font-size:10px; letter-spacing:0.2em; text-transform:uppercase; color:var(--orange); border:1px solid var(--orange); padding:3px 8px; }
+  .title { font-weight:900; font-size:18px; letter-spacing:-0.02em; margin-top:8px; }
+  .desc { color:#9aa3b2; font-family:'IBM Plex Mono', monospace; font-size:11px; text-align:center; line-height:1.6; }
+  .stage { width:180px; height:180px; display:grid; place-items:center; background:radial-gradient(circle at 50% 40%, #1a2540 0%, #0B0F1A 70%); border:1px solid #1f2a44; }
+  .stage.light { background:#F5F3EF; }
+  .row { display:flex; gap:16px; align-items:center; justify-content:center; width:100%; }
+  .wordmark { font-weight:900; letter-spacing:-0.03em; font-size:28px; }
+  .wordmark .mac { color:#fff; } .wordmark .jit { color:var(--orange); }
+  .tag { font-family:'IBM Plex Mono', monospace; font-size:9px; color:var(--orange); letter-spacing:0.22em; text-transform:uppercase; display:block; margin-top:4px; }
+</style>
+</head>
+<body>
+  <h1>MacJit — Logo Samples</h1>
+  <p class="sub">Option A → F · Pick one and I'll apply it everywhere</p>
+  <div class="grid">
+
+    <!-- Option A: Detailed emblem (current) -->
+    <div class="card">
+      <span class="label">Option A</span>
+      <div class="stage">
+        <svg width="140" height="140" viewBox="0 0 128 128">
+          <circle cx="64" cy="64" r="62" fill="#1E2A44" stroke="#F26A21" stroke-width="3"/>
+          <circle cx="64" cy="64" r="54" fill="none" stroke="#F5F3EF" stroke-opacity="0.15"/>
+          <g fill="#F26A21">
+            <script/>
+          </g>
+          <g fill="#F26A21">
+            <!-- 12 gear teeth -->
+            <g id="teeth">
+              <rect x="61" y="7" width="6" height="10" rx="1.5"/>
+            </g>
+          </g>
+          <circle cx="64" cy="64" r="38" fill="#0F1628" stroke="#F26A21" stroke-width="2"/>
+          <g stroke="#C7CAD1" stroke-width="2" fill="none">
+            <circle cx="64" cy="64" r="26"/>
+          </g>
+          <g transform="translate(64 64) rotate(45)" fill="#C7CAD1" stroke="#1E2A44" stroke-width="1.2">
+            <rect x="-4" y="-30" width="8" height="44" rx="2"/>
+            <path d="M -7 -32 a 8 8 0 1 1 14 0 l -3 4 l -3 -2 l -2 2 l -3 -2 z"/>
+          </g>
+          <path d="M 72 46 L 58 68 L 66 68 L 60 84 L 78 60 L 70 60 L 76 46 Z" fill="#F26A21" stroke="#1E2A44" stroke-width="1.5"/>
+        </svg>
+      </div>
+      <div class="title">Detailed Emblem (current)</div>
+      <div class="desc">Gear ring + wrench + tire + lightning.<br/>Rich, vintage-garage vibe. Works best large.</div>
+    </div>
+
+    <!-- Option B: Minimal MJ monogram in hexagon -->
+    <div class="card">
+      <span class="label">Option B</span>
+      <div class="stage">
+        <svg width="140" height="140" viewBox="0 0 128 128">
+          <polygon points="64,6 116,34 116,94 64,122 12,94 12,34" fill="#1E2A44" stroke="#F26A21" stroke-width="4"/>
+          <polygon points="64,18 104,40 104,88 64,110 24,88 24,40" fill="none" stroke="#F26A21" stroke-opacity="0.25" stroke-width="1.5"/>
+          <text x="64" y="82" text-anchor="middle" font-family="Chivo, sans-serif" font-weight="900" font-size="54" fill="#F26A21" letter-spacing="-3">MJ</text>
+        </svg>
+      </div>
+      <div class="title">Hex Monogram</div>
+      <div class="desc">Bold MJ inside an orange hex shield.<br/>Minimal · scales down to favicon · modern.</div>
+    </div>
+
+    <!-- Option C: Speedometer + wrench needle -->
+    <div class="card">
+      <span class="label">Option C</span>
+      <div class="stage">
+        <svg width="140" height="140" viewBox="0 0 128 128">
+          <circle cx="64" cy="64" r="62" fill="#1E2A44" stroke="#F26A21" stroke-width="3"/>
+          <!-- tick marks -->
+          <g stroke="#F5F3EF" stroke-width="2" stroke-linecap="round">
+            <g>
+              <line x1="64" y1="14" x2="64" y2="22"/>
+            </g>
+          </g>
+          <g stroke="#F5F3EF" stroke-width="2" stroke-linecap="round">
+            <!-- 11 ticks from -135deg to +135deg -->
+            <line x1="64" y1="16" x2="64" y2="24"/>
+            <line x1="26.5" y1="26.5" x2="32" y2="32" />
+            <line x1="14" y1="64" x2="22" y2="64"/>
+            <line x1="26.5" y1="101.5" x2="32" y2="96"/>
+            <line x1="64" y1="112" x2="64" y2="104"/>
+            <line x1="101.5" y1="101.5" x2="96" y2="96"/>
+            <line x1="114" y1="64" x2="106" y2="64"/>
+            <line x1="101.5" y1="26.5" x2="96" y2="32"/>
+          </g>
+          <!-- red zone arc -->
+          <path d="M 96 32 A 44 44 0 0 1 112 64" fill="none" stroke="#F26A21" stroke-width="4"/>
+          <!-- wrench needle -->
+          <g transform="translate(64 64) rotate(45)">
+            <rect x="-3" y="-44" width="6" height="48" rx="1.5" fill="#F26A21"/>
+            <path d="M -7 -48 a 7 7 0 1 1 14 0 l -2 3 l -3 -2 l -2 2 l -3 -2 z" fill="#F26A21"/>
+            <circle cx="0" cy="0" r="6" fill="#C7CAD1" stroke="#1E2A44" stroke-width="1.5"/>
+          </g>
+          <text x="64" y="96" text-anchor="middle" font-family="Chivo, sans-serif" font-weight="900" font-size="11" fill="#F26A21" letter-spacing="2">JUST IN TIME</text>
+        </svg>
+      </div>
+      <div class="title">Speed Dial</div>
+      <div class="desc">Speedometer with a wrench needle.<br/>Emphasises the "Just In Time" speed story.</div>
+    </div>
+
+    <!-- Option D: Lightning + MJ -->
+    <div class="card">
+      <span class="label">Option D</span>
+      <div class="stage">
+        <svg width="140" height="140" viewBox="0 0 128 128">
+          <rect x="8" y="8" width="112" height="112" rx="16" fill="#1E2A44" stroke="#F26A21" stroke-width="3"/>
+          <!-- Lightning bolt bg -->
+          <path d="M 78 16 L 34 68 L 58 68 L 44 112 L 98 56 L 72 56 L 84 16 Z" fill="#F26A21"/>
+          <!-- MJ -->
+          <text x="64" y="80" text-anchor="middle" font-family="Chivo, sans-serif" font-weight="900" font-size="44" fill="#1E2A44" letter-spacing="-2">MJ</text>
+        </svg>
+      </div>
+      <div class="title">Lightning MJ</div>
+      <div class="desc">Single orange bolt with "MJ" knocked out.<br/>Sporty · aggressive · high-energy.</div>
+    </div>
+
+    <!-- Option E: Circular wrench initial -->
+    <div class="card">
+      <span class="label">Option E</span>
+      <div class="stage">
+        <svg width="140" height="140" viewBox="0 0 128 128">
+          <circle cx="64" cy="64" r="58" fill="#F26A21"/>
+          <circle cx="64" cy="64" r="48" fill="#1E2A44"/>
+          <!-- Wrench forming the top of M -->
+          <g fill="#F26A21">
+            <path d="M 36 42 L 36 92 L 46 92 L 46 62 L 58 78 L 64 78 L 76 62 L 76 92 L 86 92 L 86 42 L 78 42 L 64 62 L 50 42 Z"/>
+          </g>
+          <!-- tiny orbiting dot -->
+          <circle cx="104" cy="40" r="4" fill="#F26A21"/>
+        </svg>
+      </div>
+      <div class="title">Chunky "M" Mark</div>
+      <div class="desc">Bold single-letter mark in an orange ring.<br/>Memorable · works on app icon / sticker.</div>
+    </div>
+
+    <!-- Option F: Piston + time arc -->
+    <div class="card">
+      <span class="label">Option F</span>
+      <div class="stage">
+        <svg width="140" height="140" viewBox="0 0 128 128">
+          <circle cx="64" cy="64" r="62" fill="#1E2A44" stroke="#F26A21" stroke-width="3"/>
+          <!-- Clock arc -->
+          <path d="M 32 64 A 32 32 0 1 1 96 64" fill="none" stroke="#F26A21" stroke-width="3" stroke-linecap="round" stroke-dasharray="4 4"/>
+          <!-- Piston -->
+          <g>
+            <rect x="52" y="28" width="24" height="32" rx="2" fill="#C7CAD1" stroke="#1E2A44" stroke-width="1.5"/>
+            <rect x="52" y="36" width="24" height="3" fill="#1E2A44"/>
+            <rect x="52" y="44" width="24" height="3" fill="#1E2A44"/>
+            <rect x="58" y="60" width="12" height="26" fill="#C7CAD1" stroke="#1E2A44" stroke-width="1.5"/>
+            <circle cx="64" cy="94" r="10" fill="#F26A21" stroke="#1E2A44" stroke-width="1.5"/>
+            <circle cx="64" cy="94" r="3" fill="#1E2A44"/>
+          </g>
+          <!-- Clock hand -->
+          <line x1="64" y1="94" x2="88" y2="78" stroke="#F26A21" stroke-width="3" stroke-linecap="round"/>
+        </svg>
+      </div>
+      <div class="title">Piston + Clock</div>
+      <div class="desc">Engine piston as the clock pivot.<br/>Literal "Mechanic Just In Time" storytelling.</div>
+    </div>
+  </div>
+
+  <div class="grid" style="margin-top:48px">
+    <!-- Wordmark lockup examples (B chosen) -->
+    <div class="card" style="grid-column: 1 / -1;">
+      <span class="label">Wordmark preview</span>
+      <div style="display:flex; gap:48px; flex-wrap:wrap; justify-content:center; width:100%;">
+        <div class="row">
+          <svg width="56" height="56" viewBox="0 0 128 128">
+            <polygon points="64,6 116,34 116,94 64,122 12,94 12,34" fill="#1E2A44" stroke="#F26A21" stroke-width="4"/>
+            <text x="64" y="82" text-anchor="middle" font-family="Chivo, sans-serif" font-weight="900" font-size="54" fill="#F26A21" letter-spacing="-3">MJ</text>
+          </svg>
+          <div><div class="wordmark"><span class="mac">MAC</span><span class="jit">JIT</span></div><span class="tag">Mechanic Just In Time</span></div>
+        </div>
+        <div class="row">
+          <svg width="56" height="56" viewBox="0 0 128 128">
+            <rect x="8" y="8" width="112" height="112" rx="16" fill="#1E2A44" stroke="#F26A21" stroke-width="3"/>
+            <path d="M 78 16 L 34 68 L 58 68 L 44 112 L 98 56 L 72 56 L 84 16 Z" fill="#F26A21"/>
+            <text x="64" y="80" text-anchor="middle" font-family="Chivo, sans-serif" font-weight="900" font-size="44" fill="#1E2A44" letter-spacing="-2">MJ</text>
+          </svg>
+          <div><div class="wordmark"><span class="mac">MAC</span><span class="jit">JIT</span></div><span class="tag">Mechanic Just In Time</span></div>
+        </div>
+        <div class="row">
+          <svg width="56" height="56" viewBox="0 0 128 128">
+            <circle cx="64" cy="64" r="58" fill="#F26A21"/>
+            <circle cx="64" cy="64" r="48" fill="#1E2A44"/>
+            <path d="M 36 42 L 36 92 L 46 92 L 46 62 L 58 78 L 64 78 L 76 62 L 76 92 L 86 92 L 86 42 L 78 42 L 64 62 L 50 42 Z" fill="#F26A21"/>
+          </svg>
+          <div><div class="wordmark"><span class="mac">MAC</span><span class="jit">JIT</span></div><span class="tag">Mechanic Just In Time</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

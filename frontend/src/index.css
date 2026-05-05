@@ -1,0 +1,100 @@
+@import url('https://fonts.googleapis.com/css2?family=Chivo:wght@300;400;700;900&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+    margin: 0;
+    font-family: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    background: #09090B;
+    color: #FAFAFA;
+}
+
+.font-display { font-family: 'Chivo', sans-serif; }
+.font-mono { font-family: 'IBM Plex Mono', monospace; }
+
+@layer base {
+    :root {
+        --background: 0 0% 96%;
+        --foreground: 240 6% 10%;
+        --card: 0 0% 100%;
+        --card-foreground: 240 6% 10%;
+        --popover: 0 0% 100%;
+        --popover-foreground: 240 6% 10%;
+        --primary: 240 6% 10%;
+        --primary-foreground: 0 0% 100%;
+        --secondary: 240 5% 90%;
+        --secondary-foreground: 240 6% 10%;
+        --muted: 240 5% 90%;
+        --muted-foreground: 240 4% 46%;
+        --accent: 48 96% 53%;
+        --accent-foreground: 0 0% 0%;
+        --destructive: 0 72% 51%;
+        --destructive-foreground: 0 0% 100%;
+        --border: 240 5% 89%;
+        --input: 240 5% 89%;
+        --ring: 240 6% 10%;
+        --radius: 0.5rem;
+    }
+    .dark {
+        --background: 240 6% 5%;
+        --foreground: 0 0% 98%;
+        --card: 240 4% 10%;
+        --card-foreground: 0 0% 98%;
+        --popover: 240 4% 10%;
+        --popover-foreground: 0 0% 98%;
+        --primary: 48 96% 53%;
+        --primary-foreground: 0 0% 0%;
+        --secondary: 240 4% 16%;
+        --secondary-foreground: 0 0% 98%;
+        --muted: 240 4% 16%;
+        --muted-foreground: 240 5% 65%;
+        --accent: 211 100% 50%;
+        --accent-foreground: 0 0% 100%;
+        --destructive: 0 84% 60%;
+        --destructive-foreground: 0 0% 98%;
+        --border: 240 4% 16%;
+        --input: 240 4% 16%;
+        --ring: 48 96% 53%;
+    }
+}
+
+@layer base {
+    * { @apply border-border; }
+    body { @apply bg-background text-foreground; }
+    h1, h2, h3, h4, h5 { font-family: 'Chivo', sans-serif; letter-spacing: -0.02em; }
+}
+
+/* Live pulse */
+@keyframes live-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+}
+.animate-live-pulse { animation: live-pulse 1.4s ease-in-out infinite; }
+
+/* Subtle grid background */
+.grid-bg {
+    background-image: linear-gradient(rgba(255,255,255,0.03) 1px, transparent 1px),
+                      linear-gradient(90deg, rgba(255,255,255,0.03) 1px, transparent 1px);
+    background-size: 32px 32px;
+}
+
+.scanline::before {
+    content: "";
+    position: absolute; inset: 0;
+    background: repeating-linear-gradient(0deg, rgba(255,255,255,0.04) 0 1px, transparent 1px 4px);
+    pointer-events: none;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: #09090B; }
+::-webkit-scrollbar-thumb { background: #27272A; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #3f3f46; }
+
+@layer base {
+    [data-debug-wrapper="true"] { display: contents !important; }
+}
