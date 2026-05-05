@@ -47,7 +47,3 @@ htmlcov/
 # Node (if you have frontend in same repo)
 node_modules/
 npm-debug.log
-dist/
-build/
-target/
-*.log
