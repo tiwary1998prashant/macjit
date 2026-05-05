@@ -815,13 +815,18 @@ async def auto_assign_booking(booking_id: str) -> Optional[dict]:
 
 
 # ---------- App Setup ----------
-docs_enabled = os.environ.get("ENABLE_API_DOCS", "0").strip().lower() in ("1", "true", "yes", "on")
+docs_enabled = os.environ.get("ENABLE_API_DOCS", "1").strip().lower() in ("1", "true", "yes", "on")
 app = FastAPI(
     title="MacJit GMS",
     docs_url="/api/docs" if docs_enabled else None,
     redoc_url="/api/redoc" if docs_enabled else None,
     openapi_url="/api/openapi.json" if docs_enabled else None,
 )
+
+
+@app.get("/api/health")
+async def api_health():
+    return {"status": "ok"}
 
 async def get_recipients_for_booking(booking: dict, include_customer=True, include_admin=True,
                                      include_reception=True, include_mechanic=True, include_tester=False) -> List[str]:
